@@ -74,7 +74,15 @@ Include helpers that return:
 - last anomaly/findings query timestamp
 - findings summary by severity/review state
 
-Use existing persisted models and filesystem mtimes if timestamp fields do not exist in SQLModel tables.
+Use persisted timestamp fields on `Run` and `DatasetSnapshot` as the primary source of truth. Only use filesystem mtimes as a legacy fallback if a row predates the schema upgrade.
+
+Current code reality to preserve during implementation:
+- `Run` stores `created_at`, `started_at`, `completed_at`, and `failed_at`.
+- `DatasetSnapshot` stores `created_at` and `duckdb_artifact_path` in addition to `run_id`, `row_count`, and `artifact_path`.
+- `data/dataset.duckdb` is written directly from in-memory merged rows in `app.services.jobs._write_snapshot_duckdb_artifact(...)`.
+- DuckDB is **not** rebuilt by reading `artifacts/snapshots/{run_id}/dataset.json`.
+
+So the dashboard implementation should retrieve last-run freshness from persisted lifecycle timestamps first, then fall back to file metadata only for legacy rows that lack those values.
 
 - [ ] **Step 4: Run tests to verify pass**
 

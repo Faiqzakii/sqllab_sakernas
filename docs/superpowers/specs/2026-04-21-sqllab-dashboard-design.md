@@ -112,9 +112,33 @@ Overview must **not** include:
 Overview should derive from:
 
 - `DatasetSnapshot.row_count`
-- latest dataset artifact / DuckDB freshness metadata
-- latest anomaly/findings execution freshness metadata
+- latest dataset freshness derived from persisted `Run` and `DatasetSnapshot` timestamp fields
+- latest anomaly/findings execution freshness derived from persisted `Run` lifecycle timestamps
 - aggregated findings from `FindingRuleHit` and `IdentityReviewState`
+
+### Current implementation note: freshness and persistence
+
+The current codebase now persists explicit timing fields for execution lifecycle tracking:
+
+- `Run.created_at`
+- `Run.started_at`
+- `Run.completed_at`
+- `Run.failed_at`
+- `DatasetSnapshot.created_at`
+
+Today, the persisted models only store:
+
+- `Run.id`, `job_definition_id`, `status`, `created_at`, `started_at`, `completed_at`, `failed_at`
+- `RunStepExecution.id`, `run_id`, `step_type`, `status`
+- `DatasetSnapshot.id`, `run_id`, `row_count`, `artifact_path`, `duckdb_artifact_path`, `created_at`
+
+Therefore, Overview freshness should now come from persisted records first:
+
+- last successful dataset refresh: latest successful extraction `Run.completed_at`, optionally joined to `DatasetSnapshot.created_at`
+- last anomaly/findings query run: latest successful anomaly/findings `Run.completed_at`
+- latest dataset row count: latest `DatasetSnapshot.row_count`
+
+Filesystem mtimes remain a fallback for legacy data, but they are no longer the primary source of truth for last-run timestamps.
 
 ### UX tone
 
@@ -254,6 +278,18 @@ Run Control should be built from:
 - `Run`
 - `RunStepExecution`
 - execution outputs from services/artifacts
+
+### Current implementation note: DuckDB write path
+
+The platform currently writes outputs in this order inside `app.services.jobs.execute_job_definition(...)`:
+
+1. batch/query results are accumulated in memory as pandas DataFrames
+2. those DataFrames are merged into `merged_dataframe`
+3. `merged_dataframe.to_dict(orient="records")` becomes `merged_rows`
+4. `merged_rows` are written to the JSON artifact at `artifacts/snapshots/{run_id}/dataset.json`
+5. the **same in-memory `merged_rows`** are written directly to `data/dataset.duckdb`
+
+Important: DuckDB is **not** populated by re-reading the JSON artifact. Both JSON and DuckDB outputs are sibling write targets produced from the same in-memory merged dataset.
 
 ## Domain Mapping to Current Codebase
 
