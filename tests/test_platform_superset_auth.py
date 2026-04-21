@@ -136,3 +136,68 @@ def test_env_credential_login_opens_sql_lab_in_new_tab_after_welcome(monkeypatch
     assert result.page is sql_lab_page
     assert context.new_page_calls == 2
     assert sql_lab_page.goto_calls == [("https://example.test/superset/sqllab/", "domcontentloaded")]
+
+
+def test_live_host_requires_vpn_precheck_before_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    cookies = [{"name": "session", "value": "abc123", "domain": ".bps.go.id"}]
+    page = FakePage(url="https://fasih-dashboard.bps.go.id/login/", update_url_on_goto=True)
+    context = FakeContext(page=page, cookies_sequence=[cookies])
+    browser = FakeBrowser(context=context)
+    vpn_checks: list[str] = []
+
+    monkeypatch.setattr(platform_auth, "sync_playwright", lambda: FakePlaywrightManager(browser))
+    monkeypatch.setattr(
+        platform_auth,
+        "resolve_superset_credentials",
+        lambda env_path=platform_auth.DEFAULT_ENV_PATH: ("alice", "secret"),
+    )
+    monkeypatch.setattr(
+        SupersetAuthBootstrap,
+        "ensure_vpn_connected",
+        lambda self: vpn_checks.append(self.base_url) or True,
+    )
+    monkeypatch.setattr(platform_auth, "click_sso_redirect_button", lambda page: "sso")
+    monkeypatch.setattr(
+        platform_auth,
+        "submit_login_form",
+        lambda page, username, password: {
+            "username_selector": "u",
+            "password_selector": "p",
+            "submit_selector": "s",
+        },
+    )
+
+    bootstrap = SupersetAuthBootstrap(
+        base_url="https://fasih-dashboard.bps.go.id",
+        sql_lab_url="https://fasih-dashboard.bps.go.id/superset/sqllab/",
+    )
+
+    bootstrap.login_and_capture()
+
+    assert vpn_checks == ["https://fasih-dashboard.bps.go.id"]
+
+
+def test_live_host_stops_when_vpn_precheck_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    sync_calls: list[str] = []
+
+    monkeypatch.setattr(
+        platform_auth,
+        "sync_playwright",
+        lambda: sync_calls.append("called") or FakePlaywrightManager(FakeBrowser(FakeContext(FakePage(url="https://unused"), []))),
+    )
+    monkeypatch.setattr(
+        platform_auth,
+        "resolve_superset_credentials",
+        lambda env_path=platform_auth.DEFAULT_ENV_PATH: ("alice", "secret"),
+    )
+    monkeypatch.setattr(SupersetAuthBootstrap, "ensure_vpn_connected", lambda self: False)
+
+    bootstrap = SupersetAuthBootstrap(
+        base_url="https://fasih-dashboard.bps.go.id",
+        sql_lab_url="https://fasih-dashboard.bps.go.id/superset/sqllab/",
+    )
+
+    with pytest.raises(RuntimeError, match="FortiClient VPN is required"):
+        bootstrap.login_and_capture()
+
+    assert sync_calls == []

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -30,6 +31,15 @@ SQL_TEMPLATE = (
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "ui"),
+        default="auto",
+        help="auto = use backend first with UI fallback, ui = force SupersetUiRunner only",
+    )
+    args = parser.parse_args()
+
     auth = SupersetAuthBootstrap(
         base_url="https://fasih-dashboard.bps.go.id",
         sql_lab_url="https://fasih-dashboard.bps.go.id/superset/sqllab/",
@@ -40,6 +50,8 @@ def main() -> None:
 
         def debug_callback(event: dict[str, object]) -> None:
             print("BATCH_STAGE=" + json.dumps(event, ensure_ascii=False), flush=True)
+
+        print(f"VERIFY_MODE={args.mode}", flush=True)
 
         summary: list[dict[str, object]] = []
         for level_2_code in ["01", "02", "03", "04", "71"]:
@@ -59,7 +71,10 @@ def main() -> None:
                     base_url="https://fasih-dashboard.bps.go.id",
                     ui_runner=ui_runner,
                 )
-                result = client.run_query(sql)
+                if args.mode == "ui":
+                    result = ui_runner.run_query(sql)
+                else:
+                    result = client.run_query(sql)
                 row_count = len(result.dataframe.index)
                 first_kab = None
                 if row_count:

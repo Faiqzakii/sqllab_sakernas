@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import subprocess
+import time
 from http.cookiejar import Cookie
 from pathlib import Path
 from typing import Any
@@ -63,6 +65,10 @@ LOGIN_SUBMIT_SELECTORS = (
     "button:has-text('Log in')",
 )
 SSO_REDIRECT_BUTTON_SELECTOR = "xpath=/html/body/div/div[2]/form/button"
+FORTICLIENT_ADAPTER_NAME = "Fortinet SSL VPN Virtual Ethernet Adapter"
+FORTICLIENT_EXE = r"C:\Program Files\Fortinet\FortiClient\FortiClient.exe"
+VPN_CONNECT_TIMEOUT_SECONDS = 60
+VPN_POLL_INTERVAL_SECONDS = 5
 
 
 def playwright_cookies_to_header_dict(cookies: list[dict[str, Any]]) -> dict[str, str]:
@@ -150,6 +156,11 @@ def is_authenticated_cookie(cookie: dict[str, Any], base_url: str) -> bool:
         )
         and cookie_matches_base_url(cookie, base_url)
     )
+
+
+def host_requires_vpn(base_url: str) -> bool:
+    hostname = urlparse(base_url).hostname or ""
+    return hostname.endswith("bps.go.id")
 
 
 def is_completed_manual_login_cookie(cookie: dict[str, Any], base_url: str) -> bool:
@@ -370,8 +381,58 @@ class SupersetAuthBootstrap:
         self.manual_login = manual_login
         self.credentials = None if manual_login else resolve_superset_credentials()
 
+    @staticmethod
+    def _run_powershell(command: str) -> str:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stdout.strip()
+
+    def is_vpn_connected(self) -> bool:
+        status = self._run_powershell(
+            f"(Get-NetAdapter -InterfaceDescription '{FORTICLIENT_ADAPTER_NAME}' -ErrorAction SilentlyContinue).Status"
+        )
+        return status.lower() == "up"
+
+    def ensure_vpn_connected(self) -> bool:
+        if not host_requires_vpn(self.base_url):
+            return True
+
+        if self.is_vpn_connected():
+            return True
+
+        if not os.path.exists(FORTICLIENT_EXE):
+            return False
+
+        try:
+            subprocess.Popen([FORTICLIENT_EXE])
+        except OSError:
+            return False
+
+        deadline = time.time() + VPN_CONNECT_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            if self.is_vpn_connected():
+                return True
+            time.sleep(VPN_POLL_INTERVAL_SECONDS)
+
+        return False
+
     def login_and_capture(self) -> AuthBootstrapResult:
         validate_same_origin_url(self.sql_lab_url, self.base_url)
+        if not self.ensure_vpn_connected():
+            raise RuntimeError(
+                "FortiClient VPN is required before connecting to Superset. Connect VPN first, then retry."
+            )
         playwright_manager = sync_playwright()
         playwright = playwright_manager.__enter__()
         browser = playwright.chromium.launch(headless=False)
