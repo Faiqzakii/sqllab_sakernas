@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+import pandas as pd
+import pytest
+
+import app.engine.superset_ui_runner as ui_runner_module
+from app.engine.superset_ui_runner import SupersetUiRunner
+
+
+class FakeKeyboard:
+    def press(self, key: str) -> None:
+        return None
+
+
+class FakePage:
+    def __init__(self) -> None:
+        self.url = "https://example.test/superset/sqllab/"
+        self.keyboard = FakeKeyboard()
+        self.response_callbacks = []
+        self.editor_sql = ""
+        self.focused_ace = False
+
+    def on(self, event_name: str, callback):
+        self.response_callbacks.append((event_name, callback))
+
+    def goto(self, url: str, wait_until: str) -> None:
+        self.url = url
+
+    def fill(self, selector: str, value: str) -> None:
+        self.editor_sql = value
+        return None
+
+    def click(self, selector: str) -> None:
+        if selector == ".ace_editor":
+            self.focused_ace = True
+        return None
+
+    def wait_for_timeout(self, timeout: int) -> None:
+        return None
+
+    def wait_for_load_state(self, state: str) -> None:
+        return None
+
+    def wait_for_function(self, script: str, arg=None) -> None:
+        return None
+
+    def evaluate(self, script: str, arg=None):
+        if "visibleAceCount" in script:
+            return {"visibleAceCount": 1, "hasFocusedAce": self.focused_ace}
+        if "textarea.value" in script or "editor.getValue" in script or "contentEditable" in script:
+            return self.editor_sql if self.focused_ace else "SELECT * FROM old"
+        return []
+
+    def eval_on_selector(self, selector: str, script: str, arg=None):
+        if arg is not None:
+            self.editor_sql = arg
+        return None
+
+    def content(self) -> str:
+        return ""
+
+    def screenshot(self, path: str) -> None:
+        return None
+
+
+class FakeProbe:
+    def attach(self, page: FakePage) -> "FakeProbe":
+        return self
+
+    def candidate_summaries(self) -> list[str]:
+        return []
+
+
+class FakeRequest:
+    def __init__(self, method: str = "POST", resource_type: str = "xhr") -> None:
+        self.method = method
+        self.resource_type = resource_type
+
+
+class FakeResponse:
+    def __init__(self, url: str, payload: object) -> None:
+        self.url = url
+        self.request = FakeRequest()
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_ui_runner_ignores_stale_visible_rows_until_results_change(monkeypatch) -> None:
+    page = FakePage()
+    visible_rows_sequence = [
+        [{"KODE_KAB": "71", "NKS": "old"}],
+        [{"KODE_KAB": "71", "NKS": "old"}],
+        [{"KODE_KAB": "01", "NKS": "new"}],
+    ]
+
+    def fake_capture_visible_result_rows(_page):
+        return visible_rows_sequence.pop(0)
+
+    monkeypatch.setattr(ui_runner_module, "capture_visible_result_rows", fake_capture_visible_result_rows)
+    monkeypatch.setattr(ui_runner_module, "fill_sql_editor", lambda page, sql: None)
+    monkeypatch.setattr(ui_runner_module, "click_run_query", lambda page: None)
+    monkeypatch.setattr(ui_runner_module, "SupersetNetworkProbe", FakeProbe)
+
+    runner = SupersetUiRunner(
+        sql_lab_url="https://example.test/superset/sqllab/",
+        page=page,
+        response_wait_intervals_ms=(1, 1),
+    )
+
+    result = runner.run_query("SELECT * FROM foo WHERE art.level_2_code='01'")
+
+    assert isinstance(result.dataframe, pd.DataFrame)
+    assert result.dataframe.to_dict(orient="records") == [{"KODE_KAB": "01", "NKS": "new"}]
+
+
+def test_ui_runner_verifies_editor_sql_before_accepting_result(monkeypatch) -> None:
+    page = FakePage()
+    page.editor_sql = "SELECT * FROM old"
+
+    def fake_fill_sql_editor(_page, sql: str) -> None:
+        # Simulate broken editor update that leaves old SQL in place.
+        return None
+
+    monkeypatch.setattr(ui_runner_module, "fill_sql_editor", fake_fill_sql_editor)
+    monkeypatch.setattr(ui_runner_module, "click_run_query", lambda page: None)
+    monkeypatch.setattr(ui_runner_module, "capture_visible_result_rows", lambda page: [{"KODE_KAB": "71", "NKS": "old"}])
+    monkeypatch.setattr(ui_runner_module, "SupersetNetworkProbe", FakeProbe)
+
+    runner = SupersetUiRunner(
+        sql_lab_url="https://example.test/superset/sqllab/",
+        page=page,
+        response_wait_intervals_ms=(1,),
+    )
+
+    with pytest.raises(RuntimeError, match="Editor SQL did not update"):
+        runner.run_query("SELECT * FROM foo WHERE art.level_2_code='01'")
+
+
+def test_ui_runner_focuses_visible_ace_editor_before_readback(monkeypatch) -> None:
+    page = FakePage()
+    page.editor_sql = "SELECT * FROM foo WHERE art.level_2_code='01'"
+
+    monkeypatch.setattr(ui_runner_module, "capture_visible_result_rows", lambda page: [{"KODE_KAB": "01", "NKS": "new"}])
+    monkeypatch.setattr(ui_runner_module, "SupersetNetworkProbe", FakeProbe)
+    monkeypatch.setattr(ui_runner_module, "click_run_query", lambda page: None)
+
+    runner = SupersetUiRunner(
+        sql_lab_url="https://example.test/superset/sqllab/",
+        page=page,
+        response_wait_intervals_ms=(1,),
+    )
+
+    result = runner.run_query("SELECT * FROM foo WHERE art.level_2_code='01'")
+
+    assert page.focused_ace is True
+    assert result.dataframe.to_dict(orient="records") == [{"KODE_KAB": "01", "NKS": "new"}]
+
+
+def test_ui_runner_surfaces_execute_response_error_payload(monkeypatch) -> None:
+    page = FakePage()
+    page.editor_sql = "SELECT * FROM foo WHERE art.level_2_code='01'"
+    emitted_callbacks = []
+
+    def on(event_name: str, callback):
+        emitted_callbacks.append((event_name, callback))
+
+    page.on = on
+
+    def fake_click_run_query(_page):
+        for event_name, callback in emitted_callbacks:
+            if event_name == "response":
+                callback(
+                    FakeResponse(
+                        "https://example.test/api/v1/sqllab/execute/",
+                        {"errors": [{"message": "can not access the query"}]},
+                    )
+                )
+
+    monkeypatch.setattr(ui_runner_module, "click_run_query", fake_click_run_query)
+    monkeypatch.setattr(ui_runner_module, "capture_visible_result_rows", lambda page: None)
+    monkeypatch.setattr(ui_runner_module, "SupersetNetworkProbe", FakeProbe)
+
+    runner = SupersetUiRunner(
+        sql_lab_url="https://example.test/superset/sqllab/",
+        page=page,
+        response_wait_intervals_ms=(1,),
+    )
+
+    with pytest.raises(RuntimeError, match="can not access the query"):
+        runner.run_query("SELECT * FROM foo WHERE art.level_2_code='01'")
+
+
+def test_ui_runner_reports_pending_execute_query_metadata_when_no_results_arrive(monkeypatch) -> None:
+    page = FakePage()
+    page.editor_sql = "SELECT * FROM foo WHERE art.level_2_code='01'"
+    emitted_callbacks = []
+
+    def on(event_name: str, callback):
+        emitted_callbacks.append((event_name, callback))
+
+    page.on = on
+
+    def fake_click_run_query(_page):
+        for event_name, callback in emitted_callbacks:
+            if event_name == "response":
+                callback(
+                    FakeResponse(
+                        "https://example.test/api/v1/sqllab/execute/",
+                        {"query": {"queryId": 1463098, "serverId": 1463098, "state": "pending", "resultsKey": None}},
+                    )
+                )
+
+    monkeypatch.setattr(ui_runner_module, "click_run_query", fake_click_run_query)
+    monkeypatch.setattr(ui_runner_module, "capture_visible_result_rows", lambda page: None)
+    monkeypatch.setattr(ui_runner_module, "SupersetNetworkProbe", FakeProbe)
+
+    runner = SupersetUiRunner(
+        sql_lab_url="https://example.test/superset/sqllab/",
+        page=page,
+        response_wait_intervals_ms=(1,),
+    )
+
+    with pytest.raises(RuntimeError, match="queryId=1463098.*state=pending"):
+        runner.run_query("SELECT * FROM foo WHERE art.level_2_code='01'")
+
+
+def test_ui_runner_uses_results_key_response_as_source_of_truth(monkeypatch) -> None:
+    page = FakePage()
+    page.editor_sql = "SELECT * FROM foo WHERE art.level_2_code='01'"
+    emitted_callbacks = []
+
+    def on(event_name: str, callback):
+        emitted_callbacks.append((event_name, callback))
+
+    page.on = on
+
+    def fake_click_run_query(_page):
+        for event_name, callback in emitted_callbacks:
+            if event_name == "response":
+                callback(
+                    FakeResponse(
+                        "https://example.test/api/v1/sqllab/execute/",
+                        {
+                            "query": {
+                                "queryId": 1463116,
+                                "serverId": 1463116,
+                                "state": "success",
+                                "resultsKey": "abc-key",
+                            }
+                        },
+                    )
+                )
+                callback(
+                    FakeResponse(
+                        "https://example.test/api/v1/sqllab/results/?q=(key:'abc-key',rows:10000)",
+                        {
+                            "status": "success",
+                            "data": [{"KODE_KAB": "01", "NKS": "new"}],
+                            "columns": [{"name": "KODE_KAB"}, {"name": "NKS"}],
+                        },
+                    )
+                )
+
+    monkeypatch.setattr(ui_runner_module, "click_run_query", fake_click_run_query)
+    monkeypatch.setattr(ui_runner_module, "capture_visible_result_rows", lambda page: [{"KODE_KAB": "71", "NKS": "old"}])
+    monkeypatch.setattr(ui_runner_module, "SupersetNetworkProbe", FakeProbe)
+
+    runner = SupersetUiRunner(
+        sql_lab_url="https://example.test/superset/sqllab/",
+        page=page,
+        response_wait_intervals_ms=(1,),
+    )
+
+    result = runner.run_query("SELECT * FROM foo WHERE art.level_2_code='01'")
+
+    assert result.dataframe.to_dict(orient="records") == [{"KODE_KAB": "01", "NKS": "new"}]
+
+
+def test_ui_runner_rejects_results_payload_with_mismatched_query_id(monkeypatch) -> None:
+    page = FakePage()
+    page.editor_sql = "SELECT * FROM foo WHERE art.level_2_code='02'"
+    emitted_callbacks = []
+
+    def on(event_name: str, callback):
+        emitted_callbacks.append((event_name, callback))
+
+    page.on = on
+
+    def fake_click_run_query(_page):
+        for event_name, callback in emitted_callbacks:
+            if event_name == "response":
+                callback(
+                    FakeResponse(
+                        "https://example.test/api/v1/sqllab/execute/",
+                        {
+                            "query": {
+                                "queryId": 200,
+                                "serverId": 200,
+                                "state": "success",
+                                "resultsKey": "key-200",
+                            }
+                        },
+                    )
+                )
+                callback(
+                    FakeResponse(
+                        "https://example.test/api/v1/sqllab/results/?q=(key:'old-key',rows:10000)",
+                        {
+                            "status": "success",
+                            "query_id": 199,
+                            "data": [{"KODE_KAB": "01", "NKS": "old"}],
+                        },
+                    )
+                )
+
+    monkeypatch.setattr(ui_runner_module, "click_run_query", fake_click_run_query)
+    monkeypatch.setattr(ui_runner_module, "capture_visible_result_rows", lambda page: [{"KODE_KAB": "01", "NKS": "old"}])
+    monkeypatch.setattr(ui_runner_module, "SupersetNetworkProbe", FakeProbe)
+
+    runner = SupersetUiRunner(
+        sql_lab_url="https://example.test/superset/sqllab/",
+        page=page,
+        response_wait_intervals_ms=(1,),
+    )
+
+    with pytest.raises(RuntimeError, match="resultsKey=key-200"):
+        runner.run_query("SELECT * FROM foo WHERE art.level_2_code='02'")
