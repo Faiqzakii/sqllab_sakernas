@@ -389,7 +389,8 @@ class SupersetUiRunner:
                         return
                     query_payload = payload.get("query")
                     if isinstance(query_payload, dict):
-                        if normalize_sql_text(str(query_payload.get("sql", ""))) != normalize_sql_text(sql):
+                        query_sql = query_payload.get("sql")
+                        if query_sql not in (None, "") and normalize_sql_text(str(query_sql)) != normalize_sql_text(sql):
                             self._emit_debug("execute.rejected_sql_mismatch", query=query_payload)
                             return
                         if query_payload.get("resultsKey"):
@@ -449,13 +450,14 @@ class SupersetUiRunner:
                             )
                             return
 
-                        if expected_query_id is not None and payload.get("query_id") not in {
+                        payload_query_id = payload.get("query_id")
+                        if expected_query_id is not None and payload_query_id is not None and payload_query_id not in {
                             expected_query_id,
                             expected_server_id,
                         }:
                             self._emit_debug(
                                 "results.rejected_mismatch",
-                                query_id=payload.get("query_id"),
+                                query_id=payload_query_id,
                                 expected_query_id=expected_query_id,
                                 expected_server_id=expected_server_id,
                             )
@@ -467,7 +469,7 @@ class SupersetUiRunner:
                         accepted_via_network = True
                         self._emit_debug(
                             "results.accepted",
-                            query_id=payload.get("query_id"),
+                            query_id=payload_query_id,
                             row_count=len(payload_rows),
                         )
                         return
@@ -491,8 +493,8 @@ class SupersetUiRunner:
                     raise RuntimeError("Editor SQL did not update to the requested batch query")
                 page.wait_for_timeout(SQL_EDITOR_SETTLE_DELAY_MS)
                 self._emit_debug("editor.settled", delay_ms=SQL_EDITOR_SETTLE_DELAY_MS)
-                click_run_query(page)
                 run_clicked = True
+                click_run_query(page)
                 self._emit_debug("query.run_clicked")
             except Exception as exc:
                 editor_error = exc
@@ -512,6 +514,12 @@ class SupersetUiRunner:
                     if rows_signature(visible_rows) != previous_visible_signature:
                         payload_rows = visible_rows
                         self._emit_debug("results.accepted_visible", row_count=len(payload_rows))
+
+            if payload_rows is None and execute_success_query is None and active_query_row is None and execute_pending_query is None and editor_error is None:
+                visible_rows = capture_visible_result_rows(page)
+                if visible_rows is not None:
+                    payload_rows = visible_rows
+                    self._emit_debug("results.accepted_visible_fallback", row_count=len(payload_rows))
         finally:
             try:
                 if managed_context is not None:
