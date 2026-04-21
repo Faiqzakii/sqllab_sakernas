@@ -1,11 +1,13 @@
 import json
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
 import pandas as pd
+import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-from app.models import JobDefinition, RunStepExecution
+from app.models import DatasetSnapshot, JobDefinition, Run, RunStepExecution
 from app.sample_queries import SIMULATED_COMPLETE_DATA_BATCHING, SIMULATED_COMPLETE_DATA_SQL_TEMPLATE
 from app.services.jobs import build_household_identity_key, execute_job_definition
 from app.services.runs import get_run_detail
@@ -100,6 +102,58 @@ def test_execute_job_definition_creates_run_and_snapshot_from_local_json_dataset
     assert len(run_detail["steps"]) == 6
     assert [step["status"] for step in run_detail["steps"]] == ["completed"] * 6
     assert len(persisted_steps) == 6
+
+    with Session(engine) as session:
+        persisted_run = session.exec(select(Run).where(Run.id == execution["run_id"])).one()
+        persisted_snapshot = session.exec(select(DatasetSnapshot).where(DatasetSnapshot.id == execution["snapshot_id"])).one()
+
+    assert isinstance(persisted_run.created_at, datetime)
+    assert isinstance(persisted_run.started_at, datetime)
+    assert isinstance(persisted_run.completed_at, datetime)
+    assert persisted_run.failed_at is None
+    assert persisted_run.started_at >= persisted_run.created_at
+    assert persisted_run.completed_at >= persisted_run.started_at
+    assert isinstance(persisted_snapshot.created_at, datetime)
+    assert persisted_snapshot.duckdb_artifact_path == str(duckdb_artifact)
+
+
+def test_execute_job_definition_persists_failed_at_when_executor_raises() -> None:
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+
+    class FailingSupersetExecutor:
+        def run_query(self, sql: str):
+            raise RuntimeError("superset unavailable")
+
+    with Session(engine) as session:
+        job = JobDefinition(
+            name="household-sync-live",
+            execution_mode="superset_sql",
+            sql_template=SIMULATED_COMPLETE_DATA_SQL_TEMPLATE,
+            params_schema_json={"batching_strategy": SIMULATED_COMPLETE_DATA_BATCHING},
+            merge_key_columns_json=["identity_key"],
+            identity_columns_json=["identity_key", "household_number"],
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+
+        with pytest.raises(RuntimeError, match="superset unavailable"):
+            execute_job_definition(session, job.id, superset_executor=FailingSupersetExecutor())
+
+        persisted_runs = session.exec(select(Run)).all()
+        persisted_steps = session.exec(select(RunStepExecution)).all()
+        persisted_snapshots = session.exec(select(DatasetSnapshot)).all()
+
+    assert len(persisted_runs) == 1
+    assert persisted_runs[0].status == "failed"
+    assert isinstance(persisted_runs[0].created_at, datetime)
+    assert isinstance(persisted_runs[0].started_at, datetime)
+    assert persisted_runs[0].completed_at is None
+    assert isinstance(persisted_runs[0].failed_at, datetime)
+    assert persisted_runs[0].failed_at >= persisted_runs[0].started_at
+    assert len(persisted_steps) == 6
+    assert persisted_snapshots == []
 
 
 def test_execute_job_definition_can_use_superset_executor_per_batch(tmp_path: Path) -> None:

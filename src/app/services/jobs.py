@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import duckdb
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -110,156 +111,177 @@ def execute_job_definition(
     step_types.append("snapshot_merge")
 
     run = create_and_store_run(session, job_definition_id, step_types)
+    if run.id is None:
+        raise RuntimeError("Run ID was not generated")
+    run_id = run.id
 
-    run_steps = list(session.exec(select(RunStepExecution).where(RunStepExecution.run_id == run.id)).all())
-
-    resolved_source_path = (source_data_path or DEFAULT_SOURCE_DATA_PATH).resolve()
-    rows = _load_source_rows(resolved_source_path)
-    normalized_rows: list[dict[str, Any]] = []
-    for row in rows:
-        normalized_row = dict(row)
-        normalized_row["identity_key"] = build_household_identity_key(row)
-        normalized_rows.append(normalized_row)
-
-    batch_dataframes: list[pd.DataFrame] = []
-    batch_reports: list[dict[str, Any]] = []
-    if batch_specs:
-        for step, spec in zip(run_steps[:-1], batch_specs, strict=False):
-            _log_batch_event(
-                run.id,
-                {
-                    "stage": "batch.start",
-                    "run_id": run.id,
-                    "step_id": step.id,
-                    "step_type": step.step_type,
-                    "batch_order": spec.batch_order,
-                    "batch_params": spec.batch_params,
-                },
-            )
-            if superset_executor is not None:
-                _log_batch_event(
-                    run.id,
-                    {
-                        "stage": "query.submit",
-                        "run_id": run.id,
-                        "step_id": step.id,
-                        "step_type": step.step_type,
-                        "batch_order": spec.batch_order,
-                        "rendered_sql": spec.rendered_sql,
-                    },
-                )
-                query_result = superset_executor.run_query(spec.rendered_sql)
-                batch_reports.append(
-                    {
-                        "step_id": step.id,
-                        "step_type": step.step_type,
-                        "batch_order": spec.batch_order,
-                        "batch_params": spec.batch_params,
-                        "rendered_sql": spec.rendered_sql,
-                        "source": query_result.source,
-                        "row_count": len(query_result.dataframe.index),
-                    }
-                )
-                _write_batch_debug_artifact(run.id, batch_reports)
-                _log_batch_event(
-                    run.id,
-                    {
-                        "stage": "query.complete",
-                        "run_id": run.id,
-                        "step_id": step.id,
-                        "step_type": step.step_type,
-                        "batch_order": spec.batch_order,
-                        "source": query_result.source,
-                        "row_count": len(query_result.dataframe.index),
-                    },
-                )
-                if not query_result.dataframe.empty:
-                    batch_dataframe = query_result.dataframe.copy()
-                    batch_dataframe["identity_key"] = batch_dataframe.apply(
-                        lambda row: build_household_identity_key(row.to_dict()),
-                        axis=1,
-                    )
-                    batch_dataframes.append(batch_dataframe)
-            else:
-                filtered_rows = _filter_rows_for_batch(normalized_rows, spec.batch_params)
-                batch_reports.append(
-                    {
-                        "step_id": step.id,
-                        "step_type": step.step_type,
-                        "batch_order": spec.batch_order,
-                        "batch_params": spec.batch_params,
-                        "rendered_sql": spec.rendered_sql,
-                        "source": "local_json",
-                        "row_count": len(filtered_rows),
-                    }
-                )
-                _write_batch_debug_artifact(run.id, batch_reports)
-                _log_batch_event(
-                    run.id,
-                    {
-                        "stage": "query.complete",
-                        "run_id": run.id,
-                        "step_id": step.id,
-                        "step_type": step.step_type,
-                        "batch_order": spec.batch_order,
-                        "source": "local_json",
-                        "row_count": len(filtered_rows),
-                    },
-                )
-                if filtered_rows:
-                    batch_dataframes.append(pd.DataFrame(filtered_rows))
-            step.status = "completed"
-            session.add(step)
-            _log_batch_event(
-                run.id,
-                {
-                    "stage": "batch.complete",
-                    "run_id": run.id,
-                    "step_id": step.id,
-                    "step_type": step.step_type,
-                    "batch_order": spec.batch_order,
-                },
-            )
-    else:
-        batch_dataframes.append(pd.DataFrame(normalized_rows))
-        run_steps[0].status = "completed"
-        session.add(run_steps[0])
-
-    if batch_dataframes:
-        merged_dataframe = merge_batches(batch_dataframes, merge_keys=job.merge_key_columns_json)
-    else:
-        merged_dataframe = pd.DataFrame(columns=job.merge_key_columns_json)
-    merged_rows = merged_dataframe.to_dict(orient="records")
-
-    run_steps[-1].status = "completed"
-    session.add(run_steps[-1])
-
-    run.status = "completed"
+    run.started_at = datetime.now(UTC)
     session.add(run)
-
-    artifact_path = _write_snapshot_artifact(run.id, merged_rows)
-    duckdb_artifact_path = _write_snapshot_duckdb_artifact(run.id, merged_rows)
-    batch_debug_path = _write_batch_debug_artifact(run.id, batch_reports)
-    _log_batch_event(
-        run.id,
-        {
-            "stage": "artifact.write",
-            "run_id": run.id,
-            "snapshot_path": str(artifact_path),
-            "row_count": len(merged_rows),
-        },
-    )
-    snapshot = DatasetSnapshot(run_id=run.id, row_count=len(merged_rows), artifact_path=str(artifact_path))
-    session.add(snapshot)
     session.commit()
-    session.refresh(snapshot)
+    session.refresh(run)
 
-    return {
-        "job_definition_id": job_definition_id,
-        "run_id": run.id,
-        "snapshot_id": snapshot.id,
-        "row_count": snapshot.row_count,
-        "artifact_path": snapshot.artifact_path,
-        "duckdb_artifact_path": str(duckdb_artifact_path),
-        "batch_debug_path": str(batch_debug_path),
-    }
+    run_steps = list(session.exec(select(RunStepExecution).where(RunStepExecution.run_id == run_id)).all())
+    try:
+        resolved_source_path = (source_data_path or DEFAULT_SOURCE_DATA_PATH).resolve()
+        rows = _load_source_rows(resolved_source_path)
+        normalized_rows: list[dict[str, Any]] = []
+        for row in rows:
+            normalized_row = dict(row)
+            normalized_row["identity_key"] = build_household_identity_key(row)
+            normalized_rows.append(normalized_row)
+
+        batch_dataframes: list[pd.DataFrame] = []
+        batch_reports: list[dict[str, Any]] = []
+        if batch_specs:
+            for step, spec in zip(run_steps[:-1], batch_specs, strict=False):
+                _log_batch_event(
+                    run.id,
+                    {
+                        "stage": "batch.start",
+                        "run_id": run_id,
+                        "step_id": step.id,
+                        "step_type": step.step_type,
+                        "batch_order": spec.batch_order,
+                        "batch_params": spec.batch_params,
+                    },
+                )
+                if superset_executor is not None:
+                    _log_batch_event(
+                        run_id,
+                        {
+                            "stage": "query.submit",
+                            "run_id": run_id,
+                            "step_id": step.id,
+                            "step_type": step.step_type,
+                            "batch_order": spec.batch_order,
+                            "rendered_sql": spec.rendered_sql,
+                        },
+                    )
+                    query_result = superset_executor.run_query(spec.rendered_sql)
+                    batch_reports.append(
+                        {
+                            "step_id": step.id,
+                            "step_type": step.step_type,
+                            "batch_order": spec.batch_order,
+                            "batch_params": spec.batch_params,
+                            "rendered_sql": spec.rendered_sql,
+                            "source": query_result.source,
+                            "row_count": len(query_result.dataframe.index),
+                        }
+                    )
+                    _write_batch_debug_artifact(run_id, batch_reports)
+                    _log_batch_event(
+                        run.id,
+                        {
+                            "stage": "query.complete",
+                            "run_id": run_id,
+                            "step_id": step.id,
+                            "step_type": step.step_type,
+                            "batch_order": spec.batch_order,
+                            "source": query_result.source,
+                            "row_count": len(query_result.dataframe.index),
+                        },
+                    )
+                    if not query_result.dataframe.empty:
+                        batch_dataframe = query_result.dataframe.copy()
+                        batch_dataframe["identity_key"] = batch_dataframe.apply(
+                            lambda row: build_household_identity_key(row.to_dict()),
+                            axis=1,
+                        )
+                        batch_dataframes.append(batch_dataframe)
+                else:
+                    filtered_rows = _filter_rows_for_batch(normalized_rows, spec.batch_params)
+                    batch_reports.append(
+                        {
+                            "step_id": step.id,
+                            "step_type": step.step_type,
+                            "batch_order": spec.batch_order,
+                            "batch_params": spec.batch_params,
+                            "rendered_sql": spec.rendered_sql,
+                            "source": "local_json",
+                            "row_count": len(filtered_rows),
+                        }
+                    )
+                    _write_batch_debug_artifact(run_id, batch_reports)
+                    _log_batch_event(
+                        run.id,
+                        {
+                            "stage": "query.complete",
+                            "run_id": run_id,
+                            "step_id": step.id,
+                            "step_type": step.step_type,
+                            "batch_order": spec.batch_order,
+                            "source": "local_json",
+                            "row_count": len(filtered_rows),
+                        },
+                    )
+                    if filtered_rows:
+                        batch_dataframes.append(pd.DataFrame(filtered_rows))
+                step.status = "completed"
+                session.add(step)
+                _log_batch_event(
+                    run_id,
+                    {
+                        "stage": "batch.complete",
+                        "run_id": run_id,
+                        "step_id": step.id,
+                        "step_type": step.step_type,
+                        "batch_order": spec.batch_order,
+                    },
+                )
+        else:
+            batch_dataframes.append(pd.DataFrame(normalized_rows))
+            run_steps[0].status = "completed"
+            session.add(run_steps[0])
+
+        if batch_dataframes:
+            merged_dataframe = merge_batches(batch_dataframes, merge_keys=job.merge_key_columns_json)
+        else:
+            merged_dataframe = pd.DataFrame(columns=job.merge_key_columns_json)
+        merged_rows = merged_dataframe.to_dict(orient="records")
+
+        run_steps[-1].status = "completed"
+        session.add(run_steps[-1])
+
+        artifact_path = _write_snapshot_artifact(run_id, merged_rows)
+        duckdb_artifact_path = _write_snapshot_duckdb_artifact(run_id, merged_rows)
+        batch_debug_path = _write_batch_debug_artifact(run_id, batch_reports)
+        _log_batch_event(
+            run_id,
+            {
+                "stage": "artifact.write",
+                "run_id": run_id,
+                "snapshot_path": str(artifact_path),
+                "row_count": len(merged_rows),
+            },
+        )
+        snapshot = DatasetSnapshot(
+            run_id=run_id,
+            row_count=len(merged_rows),
+            artifact_path=str(artifact_path),
+            duckdb_artifact_path=str(duckdb_artifact_path),
+            created_at=datetime.now(UTC),
+        )
+        session.add(snapshot)
+
+        run.status = "completed"
+        run.completed_at = datetime.now(UTC)
+        session.add(run)
+        session.commit()
+        session.refresh(snapshot)
+
+        return {
+            "job_definition_id": job_definition_id,
+            "run_id": run_id,
+            "snapshot_id": snapshot.id,
+            "row_count": snapshot.row_count,
+            "artifact_path": snapshot.artifact_path,
+            "duckdb_artifact_path": str(duckdb_artifact_path),
+            "batch_debug_path": str(batch_debug_path),
+        }
+    except Exception:
+        run.status = "failed"
+        run.failed_at = datetime.now(UTC)
+        session.add(run)
+        session.commit()
+        raise
