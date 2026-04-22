@@ -4,13 +4,46 @@
 
 **Goal:** Build a viewer/admin dashboard for the Superset SQL Lab Platform with read-only Overview and Findings for all users, plus admin-only Configuration and Run Control after login.
 
-**Architecture:** Extend the existing FastAPI app with session-based role gating, dashboard-oriented read APIs, and HTML UI routes/templates for Overview, Findings, Configuration, and Run Control. Reuse the existing domain entities (`JobDefinition`, `Run`, `RunStepExecution`, `DatasetSnapshot`, `FindingRuleHit`, `IdentityReviewState`) instead of inventing new product abstractions.
+**Architecture:** Repair the FastAPI API contract first, then build the dashboard on top of those stable contracts. Extend the existing FastAPI app with session-based role gating, dashboard-oriented read APIs, explicit run-control APIs, and UI routes/templates for Overview, Findings, Configuration, and Run Control. Reuse the existing domain entities (`JobDefinition`, `Run`, `RunStepExecution`, `DatasetSnapshot`, `FindingRuleHit`, `IdentityReviewState`) instead of inventing new product abstractions.
 
 **Tech Stack:** FastAPI, SQLModel, SQLite, existing Superset SQL Lab execution services, server-rendered HTML or lightweight FastAPI UI surface, pytest.
 
 ---
 
 ## File Structure
+
+## API Contract First
+
+Before implementing the dashboard UI, fix the API contract gaps. The current backend does **not** yet provide a complete contract for:
+
+- viewer/admin auth and session role lookup,
+- overview summary payload,
+- admin run-control monitoring,
+- anomaly/findings execution trigger and status,
+- clean configuration update flows.
+
+This means frontend/dashboard implementation must follow backend API work, not the other way around.
+
+### Final API contract target
+
+Implement the backend toward this final contract:
+
+- `POST /api/v1/auth/login`
+- `POST /api/v1/auth/logout`
+- `GET /api/v1/auth/session`
+- `GET /api/v1/dashboard/overview`
+- `GET /api/v1/findings`
+- `GET /api/v1/findings/{identity_key}`
+- `PATCH /api/v1/findings/{identity_key}/review-state`
+- `GET /api/v1/config/job-definition`
+- `PATCH /api/v1/config/job-definition`
+- `POST /api/v1/run-control/extraction`
+- `POST /api/v1/run-control/anomaly`
+- `GET /api/v1/run-control/latest`
+- `GET /api/v1/run-control/runs`
+- `GET /api/v1/run-control/runs/{run_id}`
+
+Use this contract as the source of truth for backend and frontend integration.
 
 ### Existing files likely to modify
 
@@ -46,7 +79,7 @@ If the codebase remains inline-HTML only, collapse templates into route handlers
 
 ---
 
-## Chunk 1: Dashboard data model and read surfaces
+## Chunk 1: API contract foundation
 
 ### Task 1: Add dashboard aggregation service
 
@@ -135,17 +168,15 @@ git add src/app/api/dashboard.py src/app/main.py tests/test_dashboard_web.py
 git commit -m "feat: add read-only dashboard summary api"
 ```
 
----
-
-## Chunk 2: Viewer/admin auth foundation
-
-### Task 3: Introduce simple session-based auth helpers
+### Task 3: Add auth/session API contract
 
 **Files:**
 - Create: `src/app/auth.py`
+- Modify: `src/app/main.py`
+- Modify: `src/app/web.py` or create a dedicated auth router
 - Test: `tests/test_auth.py`
 
-- [ ] **Step 1: Write failing tests for viewer default and admin login**
+- [ ] **Step 1: Write failing tests for viewer default, login, logout, and current role lookup**
 
 ```python
 def test_request_defaults_to_viewer_role():
@@ -153,21 +184,23 @@ def test_request_defaults_to_viewer_role():
 
 def test_successful_login_elevates_session_to_admin():
     ...
+
+def test_current_session_role_endpoint_returns_admin_after_login():
+    ...
 ```
 
 - [ ] **Step 2: Run failing tests**
 
 Run: `pytest tests/test_auth.py -v`
-Expected: FAIL because auth helpers do not exist.
+Expected: FAIL because auth/session contract does not exist yet.
 
-- [ ] **Step 3: Implement minimal session auth**
+- [ ] **Step 3: Implement minimal session auth contract**
 
-Include:
-- default viewer role
-- admin login verification using a simple configured credential source
-- role-check helpers/dependencies for admin-only pages and actions
-
-Keep it simple; do not design full RBAC.
+Add:
+- login
+- logout
+- current session / role lookup
+- admin guard helpers/dependencies
 
 - [ ] **Step 4: Run tests to verify pass**
 
@@ -177,11 +210,132 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/app/auth.py tests/test_auth.py
-git commit -m "feat: add viewer admin session auth"
+git add src/app/auth.py src/app/main.py src/app/web.py tests/test_auth.py
+git commit -m "feat: add auth session api contract"
 ```
 
-### Task 4: Protect admin-only routes
+### Task 4: Add run control API contract
+
+**Files:**
+- Modify: `src/app/api/runs.py`
+- Modify: `src/app/services/runs.py`
+- Test: `tests/test_runs_api.py`
+
+- [ ] **Step 1: Write failing tests for run history and run detail endpoints**
+
+```python
+def test_list_runs_returns_recent_execution_history():
+    ...
+
+def test_get_run_detail_returns_steps_and_status():
+    ...
+```
+
+- [ ] **Step 2: Run failing tests**
+
+Run: `pytest tests/test_runs_api.py -v`
+Expected: FAIL because read-side run-control contract is incomplete.
+
+- [ ] **Step 3: Implement run list/detail/latest-status endpoints**
+
+Add endpoints for:
+- recent runs list
+- run detail by id
+- latest run summary
+
+- [ ] **Step 4: Run tests to verify pass**
+
+Run: `pytest tests/test_runs_api.py -v`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/app/api/runs.py src/app/services/runs.py tests/test_runs_api.py
+git commit -m "feat: add run control api contract"
+```
+
+### Task 5: Add anomaly/findings execution contract
+
+**Files:**
+- Modify: `src/app/api/findings.py`
+- Modify: `src/app/services/findings.py`
+- Test: `tests/test_findings_service.py`
+
+- [ ] **Step 1: Write failing tests for anomaly/findings trigger and status behavior**
+
+```python
+def test_admin_can_trigger_anomaly_findings_run():
+    ...
+```
+
+- [ ] **Step 2: Run failing tests**
+
+Run: `pytest tests/test_findings_service.py -v`
+Expected: FAIL because anomaly/findings execution contract does not exist.
+
+- [ ] **Step 3: Implement minimal anomaly/findings execution contract**
+
+Add:
+- trigger endpoint
+- execution status/result metadata shape
+
+- [ ] **Step 4: Run tests to verify pass**
+
+Run: `pytest tests/test_findings_service.py -v`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/app/api/findings.py src/app/services/findings.py tests/test_findings_service.py
+git commit -m "feat: add anomaly findings api contract"
+```
+
+### Task 6: Add configuration update contract
+
+**Files:**
+- Modify: `src/app/api/resources.py`
+- Test: `tests/test_resources_api.py`
+
+- [ ] **Step 1: Write failing tests for updating job definition configuration**
+
+```python
+def test_admin_can_update_job_definition_configuration():
+    ...
+```
+
+- [ ] **Step 2: Run failing tests**
+
+Run: `pytest tests/test_resources_api.py -v`
+Expected: FAIL because update contract is incomplete.
+
+- [ ] **Step 3: Implement configuration update endpoint(s)**
+
+Support updating:
+- `execution_mode`
+- `sql_template`
+- `params_schema_json`
+- `merge_key_columns_json`
+- `identity_columns_json`
+
+- [ ] **Step 4: Run tests to verify pass**
+
+Run: `pytest tests/test_resources_api.py -v`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/app/api/resources.py tests/test_resources_api.py
+git commit -m "feat: add configuration update api contract"
+```
+
+---
+
+## Chunk 2: Route protection and role enforcement
+
+### Task 7: Protect admin-only routes
 
 **Files:**
 - Modify: `src/app/api/resources.py`
@@ -229,7 +383,7 @@ git commit -m "feat: protect admin mutation routes"
 
 ## Chunk 3: Viewer pages
 
-### Task 5: Build Overview page
+### Task 8: Build Overview page
 
 **Files:**
 - Modify: `src/app/web.py` or create a dedicated dashboard web module
@@ -270,7 +424,7 @@ git add src/app/web.py src/app/templates/overview.html tests/test_dashboard_web.
 git commit -m "feat: add viewer overview page"
 ```
 
-### Task 6: Build Findings page
+### Task 9: Build Findings page
 
 **Files:**
 - Modify: `src/app/web.py`
@@ -310,7 +464,7 @@ git add src/app/web.py src/app/templates/findings.html tests/test_dashboard_web.
 git commit -m "feat: add findings explorer page"
 ```
 
-### Task 7: Build Login page and admin navigation change
+### Task 10: Build Login page and admin navigation change
 
 **Files:**
 - Modify: `src/app/web.py`
@@ -351,7 +505,7 @@ git commit -m "feat: add admin login flow"
 
 ## Chunk 4: Admin configuration surface
 
-### Task 8: Build Configuration page
+### Task 11: Build Configuration page
 
 **Files:**
 - Modify: `src/app/web.py`
@@ -403,7 +557,7 @@ git commit -m "feat: add admin configuration page"
 
 ## Chunk 5: Admin run control
 
-### Task 9: Build Run Control page for extraction and anomaly/findings
+### Task 12: Build Run Control page for extraction and anomaly/findings
 
 **Files:**
 - Modify: `src/app/web.py`
@@ -457,7 +611,7 @@ git commit -m "feat: add admin run control page"
 
 ## Chunk 6: Final verification and polish
 
-### Task 10: End-to-end verification
+### Task 13: End-to-end verification
 
 **Files:**
 - Modify as needed: any touched files

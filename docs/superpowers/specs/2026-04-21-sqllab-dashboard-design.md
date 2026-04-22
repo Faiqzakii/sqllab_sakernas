@@ -325,6 +325,508 @@ Important: DuckDB is **not** populated by re-reading the JSON artifact. Both JSO
 
 These are minimal HTML pages and should be treated as scaffolding, not the final dashboard architecture.
 
+## API Contract Status
+
+The current FastAPI API contract is **not yet sufficient** for the approved dashboard architecture.
+
+### What already exists
+
+Existing endpoints:
+
+- `POST /job-definitions`
+- `GET /job-definitions`
+- `POST /job-definitions/{job_definition_id}/execute`
+- `POST /rule-definitions`
+- `GET /rule-definitions`
+- `POST /snapshots`
+- `GET /snapshots`
+- `POST /runs`
+- `GET /identity-findings`
+- `POST /identity-findings/{identity_key}/status`
+
+These are useful building blocks, but they do not yet form a clean dashboard contract.
+
+### What is missing
+
+The backend still needs explicit contracts for:
+
+1. **Overview summary**
+   - one endpoint returning latest dataset row count, last successful update timestamp, last anomaly/findings query timestamp, and findings summary
+
+2. **Auth/session**
+   - login
+   - logout
+   - current session / role lookup
+   - role enforcement for admin-only actions
+
+3. **Run Control monitoring**
+   - latest extraction run summary
+   - latest anomaly/findings run summary
+   - run list/history
+   - run detail by id
+   - step detail and status
+   - output/artifact references
+
+4. **Anomaly/findings execution**
+   - a dedicated trigger contract for running anomaly/findings
+   - execution status/result metadata for that process
+
+5. **Configuration updates**
+   - explicit update endpoints for dashboard-managed `JobDefinition` fields and SQL Lab config fields
+
+### Design implication
+
+The docs should treat API contract repair as a prerequisite step. Frontend work, especially a React frontend, should not start until the backend contracts above are explicitly defined and tested.
+
+## Final API Contract
+
+This is the recommended concrete FastAPI contract for the approved dashboard.
+
+### Versioning
+
+Use a versioned API prefix:
+
+- `/api/v1/...`
+
+### Auth / Session
+
+#### `POST /api/v1/auth/login`
+
+Purpose: elevate a viewer session to admin.
+
+Request:
+
+```json
+{
+  "username": "admin",
+  "password": "secret"
+}
+```
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "role": "admin",
+    "authenticated": true
+  }
+}
+```
+
+Response `401`:
+
+```json
+{
+  "error": {
+    "code": "invalid_credentials",
+    "message": "Invalid username or password"
+  }
+}
+```
+
+#### `POST /api/v1/auth/logout`
+
+Purpose: clear admin session and return to viewer mode.
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "role": "viewer",
+    "authenticated": false
+  }
+}
+```
+
+#### `GET /api/v1/auth/session`
+
+Purpose: return the current session role for frontend gating.
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "role": "viewer",
+    "authenticated": false
+  }
+}
+```
+
+or
+
+```json
+{
+  "data": {
+    "role": "admin",
+    "authenticated": true
+  }
+}
+```
+
+### Overview
+
+#### `GET /api/v1/dashboard/overview`
+
+Access: viewer and admin
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "latest_dataset": {
+      "row_count": 1400000,
+      "last_successful_update_at": "2026-04-21T08:42:00Z"
+    },
+    "anomaly_query": {
+      "last_run_at": "2026-04-21T09:10:00Z"
+    },
+    "findings_summary": {
+      "total": 183,
+      "by_severity": {
+        "critical": 27,
+        "warn": 91,
+        "info": 65
+      },
+      "by_review_state": {
+        "open": 120,
+        "reviewed": 40,
+        "closed": 23
+      }
+    }
+  }
+}
+```
+
+### Findings
+
+#### `GET /api/v1/findings`
+
+Access: viewer and admin
+
+Query parameters:
+
+- `identity_key`
+- `severity`
+- `rule_id`
+- `review_state`
+- `page`
+- `per_page`
+
+Response `200`:
+
+```json
+{
+  "data": [
+    {
+      "identity_key": "id-001",
+      "highest_severity": "critical",
+      "rule_ids": [1, 2],
+      "review_state": "open",
+      "identity_payload": {
+        "identity_key": "id-001",
+        "household_number": "12"
+      }
+    }
+  ],
+  "meta": {
+    "total": 1,
+    "page": 1,
+    "per_page": 20,
+    "total_pages": 1
+  }
+}
+```
+
+#### `GET /api/v1/findings/{identity_key}`
+
+Access: viewer and admin
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "identity_key": "id-001",
+    "highest_severity": "critical",
+    "rule_ids": [1, 2],
+    "review_state": "open",
+    "identity_payload": {
+      "identity_key": "id-001",
+      "household_number": "12"
+    }
+  }
+}
+```
+
+#### `PATCH /api/v1/findings/{identity_key}/review-state`
+
+Access: admin only
+
+Request:
+
+```json
+{
+  "review_state": "reviewed"
+}
+```
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "identity_key": "id-001",
+    "review_state": "reviewed"
+  }
+}
+```
+
+### Configuration
+
+#### `GET /api/v1/config/job-definition`
+
+Access: admin only
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "id": 1,
+    "name": "settlement_monitoring_project",
+    "execution_mode": "superset_sql",
+    "sql_template": "select ...",
+    "params_schema_json": {
+      "base_url": "https://superset.local",
+      "sql_lab_url": "https://superset.local/sqllab/",
+      "source_data_path": "data/source.json",
+      "batching_strategy": {
+        "param": "level_2_code",
+        "values": ["01", "02", "03"]
+      }
+    },
+    "merge_key_columns_json": ["identity_key"],
+    "identity_columns_json": ["identity_key"]
+  }
+}
+```
+
+#### `PATCH /api/v1/config/job-definition`
+
+Access: admin only
+
+Request:
+
+```json
+{
+  "name": "settlement_monitoring_project",
+  "execution_mode": "superset_sql",
+  "sql_template": "select ...",
+  "params_schema_json": {
+    "base_url": "https://superset.local",
+    "sql_lab_url": "https://superset.local/sqllab/",
+    "source_data_path": "data/source.json",
+    "batching_strategy": {
+      "param": "level_2_code",
+      "values": ["01", "02", "03"]
+    }
+  },
+  "merge_key_columns_json": ["identity_key"],
+  "identity_columns_json": ["identity_key"]
+}
+```
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "id": 1,
+    "updated": true
+  }
+}
+```
+
+### Run Control
+
+#### `POST /api/v1/run-control/extraction`
+
+Access: admin only
+
+Request:
+
+```json
+{
+  "job_definition_id": 1,
+  "debug": false
+}
+```
+
+Response `202`:
+
+```json
+{
+  "data": {
+    "run_type": "extraction",
+    "run_id": 55,
+    "status": "pending"
+  }
+}
+```
+
+#### `POST /api/v1/run-control/anomaly`
+
+Access: admin only
+
+Request:
+
+```json
+{
+  "dataset_snapshot_id": 55
+}
+```
+
+Response `202`:
+
+```json
+{
+  "data": {
+    "run_type": "anomaly",
+    "run_id": 77,
+    "status": "pending"
+  }
+}
+```
+
+#### `GET /api/v1/run-control/latest`
+
+Access: admin only
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "extraction": {
+      "run_id": 55,
+      "status": "completed",
+      "completed_at": "2026-04-21T08:42:00Z"
+    },
+    "anomaly": {
+      "run_id": 77,
+      "status": "completed",
+      "completed_at": "2026-04-21T09:10:00Z"
+    }
+  }
+}
+```
+
+#### `GET /api/v1/run-control/runs`
+
+Access: admin only
+
+Query parameters:
+
+- `run_type=extraction|anomaly`
+- `page`
+- `per_page`
+
+Response `200`:
+
+```json
+{
+  "data": [
+    {
+      "run_id": 55,
+      "run_type": "extraction",
+      "status": "completed",
+      "created_at": "2026-04-21T08:40:00Z",
+      "completed_at": "2026-04-21T08:42:00Z"
+    }
+  ],
+  "meta": {
+    "total": 1,
+    "page": 1,
+    "per_page": 20,
+    "total_pages": 1
+  }
+}
+```
+
+#### `GET /api/v1/run-control/runs/{run_id}`
+
+Access: admin only
+
+Response `200`:
+
+```json
+{
+  "data": {
+    "run_id": 55,
+    "run_type": "extraction",
+    "status": "completed",
+    "job_definition_id": 1,
+    "steps": [
+      {
+        "id": 1,
+        "step_type": "superset_sql:01",
+        "status": "completed"
+      },
+      {
+        "id": 2,
+        "step_type": "snapshot_merge",
+        "status": "completed"
+      }
+    ],
+    "outputs": {
+      "row_count": 1400000,
+      "artifact_path": "artifacts/snapshots/55/dataset.json",
+      "duckdb_artifact_path": "data/dataset.duckdb",
+      "batch_debug_path": "artifacts/snapshots/55/batches.json"
+    }
+  }
+}
+```
+
+### Access Rules Summary
+
+#### Viewer
+
+Allowed:
+
+- `GET /api/v1/auth/session`
+- `GET /api/v1/dashboard/overview`
+- `GET /api/v1/findings`
+- `GET /api/v1/findings/{identity_key}`
+
+#### Admin
+
+Allowed:
+
+- all viewer endpoints
+- `POST /api/v1/auth/logout`
+- `PATCH /api/v1/findings/{identity_key}/review-state`
+- `GET /api/v1/config/job-definition`
+- `PATCH /api/v1/config/job-definition`
+- all `/api/v1/run-control/*` endpoints
+
+### Status Code Rules
+
+Recommended status codes:
+
+- `200` for successful reads and updates
+- `202` for async run triggers
+- `401` for unauthenticated requests
+- `403` for forbidden viewer-to-admin access
+- `404` for missing resources
+- `422` for validation errors
+- `500` for unexpected internal failures
+- `502` / `503` for upstream Superset failures when applicable
+
 ## Product Constraints
 
 1. The dashboard must reflect the current platform shape rather than a generic analytics product.
