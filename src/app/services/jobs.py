@@ -4,7 +4,7 @@ import duckdb
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 from sqlmodel import Session, select
@@ -61,12 +61,68 @@ def _write_snapshot_duckdb_artifact(run_id: int, rows: list[dict[str, Any]]) -> 
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
 
     dataframe = pd.DataFrame(rows)
-    with duckdb.connect(str(artifact_path)) as connection:
+    connection = duckdb.connect(str(artifact_path))
+    try:
         connection.register("snapshot_rows", dataframe)
         connection.execute("CREATE OR REPLACE TABLE snapshot_data AS SELECT * FROM snapshot_rows")
         connection.unregister("snapshot_rows")
+    finally:
+        connection.close()
 
     return artifact_path
+
+
+def _read_existing_duckdb_rows(artifact_path: Path) -> list[dict[str, Any]]:
+    if not artifact_path.exists():
+        return []
+
+    connection = duckdb.connect(str(artifact_path), read_only=True)
+    try:
+        table_names = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
+        if "snapshot_data" not in table_names:
+            return []
+        dataframe = connection.execute("SELECT * FROM snapshot_data").fetchdf()
+        if dataframe.empty:
+            return []
+        return cast(list[dict[str, Any]], dataframe.to_dict(orient="records"))
+    finally:
+        connection.close()
+
+
+def _upsert_snapshot_rows_by_identity_key(
+    existing_rows: list[dict[str, Any]],
+    incoming_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not existing_rows:
+        return [dict(row) for row in incoming_rows]
+    if not incoming_rows:
+        return [dict(row) for row in existing_rows]
+
+    merge_key = "identity_key"
+    if any(merge_key not in row for row in existing_rows) or any(merge_key not in row for row in incoming_rows):
+        return [dict(row) for row in incoming_rows]
+
+    ordered_columns: list[str] = []
+    for row in [*existing_rows, *incoming_rows]:
+        for column in row.keys():
+            if column not in ordered_columns:
+                ordered_columns.append(column)
+
+    merged_by_key: dict[str, dict[str, Any]] = {
+        str(row[merge_key]): dict(row)
+        for row in existing_rows
+    }
+    for row in incoming_rows:
+        key = str(row[merge_key])
+        if key in merged_by_key:
+            merged_by_key[key].update(dict(row))
+        else:
+            merged_by_key[key] = dict(row)
+
+    return [
+        {column: row.get(column) for column in ordered_columns}
+        for row in merged_by_key.values()
+    ]
 
 
 def _write_batch_debug_artifact(run_id: int, payload: list[dict[str, Any]]) -> Path:
@@ -243,8 +299,12 @@ def execute_job_definition(
         run_steps[-1].status = "completed"
         session.add(run_steps[-1])
 
-        artifact_path = _write_snapshot_artifact(run_id, merged_rows)
-        duckdb_artifact_path = _write_snapshot_duckdb_artifact(run_id, merged_rows)
+        duckdb_target_path = Path("data") / "dataset.duckdb"
+        existing_duckdb_rows = _read_existing_duckdb_rows(duckdb_target_path)
+        published_rows = _upsert_snapshot_rows_by_identity_key(existing_duckdb_rows, merged_rows)
+
+        artifact_path = _write_snapshot_artifact(run_id, published_rows)
+        duckdb_artifact_path = _write_snapshot_duckdb_artifact(run_id, published_rows)
         batch_debug_path = _write_batch_debug_artifact(run_id, batch_reports)
         _log_batch_event(
             run_id,
@@ -252,12 +312,13 @@ def execute_job_definition(
                 "stage": "artifact.write",
                 "run_id": run_id,
                 "snapshot_path": str(artifact_path),
-                "row_count": len(merged_rows),
+                "row_count": len(published_rows),
+                "incoming_row_count": len(merged_rows),
             },
         )
         snapshot = DatasetSnapshot(
             run_id=run_id,
-            row_count=len(merged_rows),
+            row_count=len(published_rows),
             artifact_path=str(artifact_path),
             duckdb_artifact_path=str(duckdb_artifact_path),
             created_at=datetime.now(UTC),
@@ -275,13 +336,25 @@ def execute_job_definition(
             "run_id": run_id,
             "snapshot_id": snapshot.id,
             "row_count": snapshot.row_count,
+            "incoming_row_count": len(merged_rows),
             "artifact_path": snapshot.artifact_path,
             "duckdb_artifact_path": str(duckdb_artifact_path),
             "batch_debug_path": str(batch_debug_path),
         }
     except Exception:
+        for step in run_steps:
+            if step.status != "completed":
+                step.status = "failed"
+                session.add(step)
         run.status = "failed"
         run.failed_at = datetime.now(UTC)
         session.add(run)
         session.commit()
         raise
+    finally:
+        executor_close = getattr(superset_executor, "close", None)
+        if callable(executor_close):
+            try:
+                executor_close()
+            except Exception:
+                pass

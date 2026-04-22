@@ -1,0 +1,12 @@
+{
+  "name": "superset-sqllab-platform",
+  "private": true,
+  "scripts": {
+    "build:css": "npx @tailwindcss/cli -i ./src/app/static_src/app.css -o ./src/app/static/styles/app.css --minify",
+    "watch:css": "npx @tailwindcss/cli -i ./src/app/static_src/app.css -o ./src/app/static/styles/app.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.2.4",
+    "tailwindcss": "^4.2.4"
+  }
+}

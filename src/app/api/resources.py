@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter
+from fastapi import Depends
 from fastapi import HTTPException
 from fastapi import Query
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
+from app.auth import require_admin_session
 from app.db import engine
-from pathlib import Path
 
-from app.engine.superset_auth import SupersetAuthBootstrap
-from app.engine.superset_client import SupersetClient
-from app.engine.superset_ui_runner import SupersetUiRunner
+from app.engine.superset_executor import build_superset_executor
 from app.models import DatasetSnapshot, JobDefinition, RuleDefinition
 from app.services.jobs import execute_job_definition
 
@@ -19,28 +20,11 @@ from app.services.jobs import execute_job_definition
 router = APIRouter()
 
 
-def build_superset_executor(job: JobDefinition):
-    if job.execution_mode != "superset_sql":
+def _latest_job_definition(session: Session) -> JobDefinition | None:
+    jobs = session.exec(select(JobDefinition)).all()
+    if not jobs:
         return None
-
-    params = job.params_schema_json if isinstance(job.params_schema_json, dict) else {}
-    base_url = params.get("base_url")
-    sql_lab_url = params.get("sql_lab_url")
-    if not isinstance(base_url, str) or not isinstance(sql_lab_url, str):
-        return None
-
-    auth = SupersetAuthBootstrap(base_url=base_url, sql_lab_url=sql_lab_url)
-    auth_result = auth.login_and_capture()
-    session = auth.build_requests_session(auth_result.cookies)
-    ui_runner = SupersetUiRunner(
-        sql_lab_url=sql_lab_url,
-        auth_cookies=auth_result.cookies,
-        browser=auth_result.browser,
-        context=auth_result.context,
-        page=auth_result.page,
-    )
-    client = SupersetClient(session=session, base_url=base_url, ui_runner=ui_runner)
-    return client
+    return max(jobs, key=lambda job: job.id or 0)
 
 
 class JobDefinitionCreateRequest(BaseModel):
@@ -65,7 +49,16 @@ class SnapshotCreateRequest(BaseModel):
     artifact_path: str
 
 
-@router.post("/job-definitions")
+class JobDefinitionUpdateRequest(BaseModel):
+    name: str | None = None
+    execution_mode: str | None = None
+    sql_template: str | None = None
+    params_schema_json: dict | None = None
+    merge_key_columns_json: list[str] | None = None
+    identity_columns_json: list[str] | None = None
+
+
+@router.post("/job-definitions", dependencies=[Depends(require_admin_session)])
 def create_job_definition(request: JobDefinitionCreateRequest) -> dict:
     with Session(engine) as session:
         job = JobDefinition(**request.model_dump())
@@ -75,19 +68,19 @@ def create_job_definition(request: JobDefinitionCreateRequest) -> dict:
         return job.model_dump()
 
 
-@router.get("/job-definitions")
+@router.get("/job-definitions", dependencies=[Depends(require_admin_session)])
 def list_job_definitions() -> list[dict]:
     with Session(engine) as session:
         jobs = session.exec(select(JobDefinition)).all()
         return [job.model_dump() for job in jobs]
 
 
-@router.post("/job-definitions/{job_definition_id}/execute")
+@router.post("/job-definitions/{job_definition_id}/execute", dependencies=[Depends(require_admin_session)])
 def execute_job(job_definition_id: int, debug: bool = Query(default=False)) -> dict:
     with Session(engine) as session:
         job = session.get(JobDefinition, job_definition_id)
         if job is None:
-            raise ValueError(f"Job definition not found: {job_definition_id}")
+            raise HTTPException(status_code=404, detail={"error": {"code": "job_not_found", "message": "Job definition not found"}})
         source_data_path = job.params_schema_json.get("source_data_path")
         resolved_path = Path(source_data_path) if isinstance(source_data_path, str) else None
         superset_executor = build_superset_executor(job)
@@ -104,7 +97,7 @@ def execute_job(job_definition_id: int, debug: bool = Query(default=False)) -> d
             raise
 
 
-@router.post("/rule-definitions")
+@router.post("/rule-definitions", dependencies=[Depends(require_admin_session)])
 def create_rule_definition(request: RuleDefinitionCreateRequest) -> dict:
     with Session(engine) as session:
         rule = RuleDefinition(**request.model_dump())
@@ -114,14 +107,14 @@ def create_rule_definition(request: RuleDefinitionCreateRequest) -> dict:
         return rule.model_dump()
 
 
-@router.get("/rule-definitions")
+@router.get("/rule-definitions", dependencies=[Depends(require_admin_session)])
 def list_rule_definitions() -> list[dict]:
     with Session(engine) as session:
         rules = session.exec(select(RuleDefinition)).all()
         return [rule.model_dump() for rule in rules]
 
 
-@router.post("/snapshots")
+@router.post("/snapshots", dependencies=[Depends(require_admin_session)])
 def create_snapshot(request: SnapshotCreateRequest) -> dict:
     with Session(engine) as session:
         snapshot = DatasetSnapshot(**request.model_dump())
@@ -131,8 +124,39 @@ def create_snapshot(request: SnapshotCreateRequest) -> dict:
         return snapshot.model_dump()
 
 
-@router.get("/snapshots")
+@router.get("/snapshots", dependencies=[Depends(require_admin_session)])
 def list_snapshots() -> list[dict]:
     with Session(engine) as session:
         snapshots = session.exec(select(DatasetSnapshot)).all()
         return [snapshot.model_dump() for snapshot in snapshots]
+
+
+@router.get("/api/v1/config/job-definition", dependencies=[Depends(require_admin_session)])
+def get_job_definition_configuration() -> dict[str, dict[str, object]]:
+    with Session(engine) as session:
+        job = _latest_job_definition(session)
+        if job is None:
+            raise HTTPException(status_code=404, detail={"error": {"code": "job_not_found", "message": "No job definition configured"}})
+        return {"data": job.model_dump()}
+
+
+@router.patch("/api/v1/config/job-definition", dependencies=[Depends(require_admin_session)])
+def update_job_definition_configuration(request: JobDefinitionUpdateRequest) -> dict[str, dict[str, object]]:
+    with Session(engine) as session:
+        job = _latest_job_definition(session)
+        if job is None:
+            raise HTTPException(status_code=404, detail={"error": {"code": "job_not_found", "message": "No job definition configured"}})
+
+        payload = request.model_dump(exclude_none=True)
+        for field_name, value in payload.items():
+            setattr(job, field_name, value)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        return {
+            "data": {
+                "id": job.id,
+                "updated": True,
+                **job.model_dump(),
+            }
+        }
