@@ -5,7 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
   "fastapi>=0.116.1",
   "pandas>=2.3.2",
-  "playwright>=1.55.0",
+  "camoufox>=0.4.11",
   "requests>=2.32.5",
   "sqlmodel>=0.0.24",
   "uvicorn>=0.35.0",
