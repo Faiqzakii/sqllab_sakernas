@@ -10,11 +10,11 @@ from typing import Any
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
 import requests
-from playwright.sync_api import sync_playwright
+from app.engine.browser_factory import launch_stealth_browser
 
 
-PLAYWRIGHT_COOKIE_NAME = "name"
-PLAYWRIGHT_COOKIE_VALUE = "value"
+BROWSER_COOKIE_NAME = "name"
+BROWSER_COOKIE_VALUE = "value"
 XSRF_COOKIE_NAME = "XSRF-TOKEN"
 XSRF_HEADER_NAME = "X-XSRF-TOKEN"
 AUTH_WAIT_TIMEOUT_MS = 30_000
@@ -71,20 +71,20 @@ VPN_CONNECT_TIMEOUT_SECONDS = 60
 VPN_POLL_INTERVAL_SECONDS = 5
 
 
-def playwright_cookies_to_header_dict(cookies: list[dict[str, Any]]) -> dict[str, str]:
+def browser_cookies_to_header_dict(cookies: list[dict[str, Any]]) -> dict[str, str]:
     return {
-        str(cookie[PLAYWRIGHT_COOKIE_NAME]): str(cookie[PLAYWRIGHT_COOKIE_VALUE])
+        str(cookie[BROWSER_COOKIE_NAME]): str(cookie[BROWSER_COOKIE_VALUE])
         for cookie in cookies
-        if PLAYWRIGHT_COOKIE_NAME in cookie and PLAYWRIGHT_COOKIE_VALUE in cookie
+        if BROWSER_COOKIE_NAME in cookie and BROWSER_COOKIE_VALUE in cookie
     }
 
 
 def extract_xsrf_token(cookies: list[dict[str, Any]]) -> str | None:
     accepted_names = {XSRF_COOKIE_NAME.lower(), *XSRF_COOKIE_NAMES}
     for cookie in cookies:
-        cookie_name = cookie.get(PLAYWRIGHT_COOKIE_NAME)
+        cookie_name = cookie.get(BROWSER_COOKIE_NAME)
         if isinstance(cookie_name, str) and cookie_name.lower() in accepted_names:
-            value = cookie.get(PLAYWRIGHT_COOKIE_VALUE)
+            value = cookie.get(BROWSER_COOKIE_VALUE)
             return None if value is None else str(value)
     return None
 
@@ -145,8 +145,8 @@ def is_likely_auth_cookie_name(name: str) -> bool:
 
 
 def is_authenticated_cookie(cookie: dict[str, Any], base_url: str) -> bool:
-    name = cookie.get(PLAYWRIGHT_COOKIE_NAME)
-    value = cookie.get(PLAYWRIGHT_COOKIE_VALUE)
+    name = cookie.get(BROWSER_COOKIE_NAME)
+    value = cookie.get(BROWSER_COOKIE_VALUE)
     normalized_name = name.strip().lower() if isinstance(name, str) else ""
     return (
         isinstance(name, str)
@@ -164,8 +164,8 @@ def host_requires_vpn(base_url: str) -> bool:
 
 
 def is_completed_manual_login_cookie(cookie: dict[str, Any], base_url: str) -> bool:
-    name = cookie.get(PLAYWRIGHT_COOKIE_NAME)
-    value = cookie.get(PLAYWRIGHT_COOKIE_VALUE)
+    name = cookie.get(BROWSER_COOKIE_NAME)
+    value = cookie.get(BROWSER_COOKIE_VALUE)
     return (
         isinstance(name, str)
         and value not in (None, "")
@@ -307,9 +307,9 @@ def click_sso_redirect_button(page: Any) -> str:
     return SSO_REDIRECT_BUTTON_SELECTOR
 
 
-def playwright_cookie_to_requests_cookie(cookie: dict[str, Any]) -> Cookie | None:
-    name = cookie.get(PLAYWRIGHT_COOKIE_NAME)
-    value = cookie.get(PLAYWRIGHT_COOKIE_VALUE)
+def browser_cookie_to_requests_cookie(cookie: dict[str, Any]) -> Cookie | None:
+    name = cookie.get(BROWSER_COOKIE_NAME)
+    value = cookie.get(BROWSER_COOKIE_VALUE)
     if name is None or value is None:
         return None
 
@@ -338,7 +338,7 @@ class CleanupError(Exception):
         super().__init__("; ".join(str(error) for error in self.errors))
 
 
-def cleanup_resources(context: Any, browser: Any, playwright_manager: Any) -> None:
+def cleanup_resources(context: Any, browser: Any, browser_manager: Any) -> None:
     cleanup_errors: list[Exception] = []
     if context is not None:
         try:
@@ -350,9 +350,9 @@ def cleanup_resources(context: Any, browser: Any, playwright_manager: Any) -> No
             browser.close()
         except Exception as exc:
             cleanup_errors.append(exc)
-    if playwright_manager is not None:
+    if browser_manager is not None:
         try:
-            playwright_manager.__exit__(None, None, None)
+            browser_manager.__exit__(None, None, None)
         except Exception as exc:
             cleanup_errors.append(exc)
     if cleanup_errors:
@@ -364,14 +364,13 @@ class AuthBootstrapResult:
     final_url: str
     cookies: list[dict[str, Any]]
     xsrf_token: str | None
-    playwright_manager: Any | None = None
-    playwright_instance: Any | None = None
+    browser_manager: Any | None = None
     browser: Any | None = None
     context: Any | None = None
     page: Any | None = None
 
     def close(self) -> None:
-        cleanup_resources(self.context, self.browser, self.playwright_manager)
+        cleanup_resources(self.context, self.browser, self.browser_manager)
 
 
 class SupersetAuthBootstrap:
@@ -433,10 +432,10 @@ class SupersetAuthBootstrap:
             raise RuntimeError(
                 "FortiClient VPN is required before connecting to Superset. Connect VPN first, then retry."
             )
-        playwright_manager = sync_playwright()
-        playwright = playwright_manager.__enter__()
-        browser = playwright.chromium.launch(headless=False)
-        context = browser.new_context()
+        session = launch_stealth_browser(headless=False)
+        browser_manager = session.manager
+        browser = session.browser
+        context = session.context
         try:
             page = context.new_page()
             use_login_page = self.manual_login or self.credentials is not None
@@ -510,7 +509,7 @@ class SupersetAuthBootstrap:
                 )
         except Exception as exc:
             try:
-                cleanup_resources(context, browser, playwright_manager)
+                cleanup_resources(context, browser, browser_manager)
             except CleanupError as cleanup_error:
                 exc.__context__ = cleanup_error
             raise
@@ -519,8 +518,7 @@ class SupersetAuthBootstrap:
             final_url=sanitize_url(final_url),
             cookies=cookies,
             xsrf_token=extract_xsrf_token(cookies),
-            playwright_manager=playwright_manager,
-            playwright_instance=playwright,
+            browser_manager=browser_manager,
             browser=browser,
             context=context,
             page=page,
@@ -533,10 +531,10 @@ class SupersetAuthBootstrap:
             cookie
             for cookie in cookies
             if cookie_matches_base_url(cookie, self.base_url)
-            and is_likely_auth_cookie_name(str(cookie.get(PLAYWRIGHT_COOKIE_NAME) or ""))
+            and is_likely_auth_cookie_name(str(cookie.get(BROWSER_COOKIE_NAME) or ""))
         ]
         for cookie in filtered_cookies:
-            requests_cookie = playwright_cookie_to_requests_cookie(cookie)
+            requests_cookie = browser_cookie_to_requests_cookie(cookie)
             if requests_cookie is not None:
                 session.cookies.set_cookie(requests_cookie)
         xsrf_token = extract_xsrf_token(filtered_cookies)

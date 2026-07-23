@@ -96,16 +96,16 @@ class FakeBrowser:
         return None
 
 
-class FakePlaywrightManager:
-    def __init__(self, browser: FakeBrowser) -> None:
-        self.browser = browser
-
-    def __enter__(self) -> object:
-        chromium = type("Chromium", (), {"launch": lambda _self, headless=False: self.browser})()
-        return type("Playwright", (), {"chromium": chromium})()
-
+class FakeBrowserManager:
     def __exit__(self, exc_type, exc, tb) -> None:
         return None
+
+
+class FakeBrowserSession:
+    def __init__(self, context: FakeContext, browser: FakeBrowser | None = None) -> None:
+        self.manager = FakeBrowserManager()
+        self.context = context
+        self.browser = browser
 
 
 def test_env_credential_login_opens_sql_lab_in_new_tab_after_welcome(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -118,7 +118,13 @@ def test_env_credential_login_opens_sql_lab_in_new_tab_after_welcome(monkeypatch
     sql_lab_page = FakePage(url="https://example.test/superset/sqllab/", update_url_on_goto=True)
     context = FakeContext(page=welcome_page, cookies_sequence=[cookies, cookies], extra_pages=[sql_lab_page])
     browser = FakeBrowser(context=context)
-    monkeypatch.setattr(platform_auth, "sync_playwright", lambda: FakePlaywrightManager(browser))
+    launch_calls: list[dict[str, object]] = []
+
+    def fake_launch(**kwargs: object) -> FakeBrowserSession:
+        launch_calls.append(kwargs)
+        return FakeBrowserSession(context=context, browser=None)
+
+    monkeypatch.setattr(platform_auth, "launch_stealth_browser", fake_launch)
     monkeypatch.setattr(
         platform_auth,
         "resolve_superset_credentials",
@@ -134,8 +140,10 @@ def test_env_credential_login_opens_sql_lab_in_new_tab_after_welcome(monkeypatch
 
     assert result.final_url == "https://example.test/superset/sqllab/"
     assert result.page is sql_lab_page
+    assert result.browser_manager is not None
     assert context.new_page_calls == 2
     assert sql_lab_page.goto_calls == [("https://example.test/superset/sqllab/", "domcontentloaded")]
+    assert launch_calls == [{"headless": False}]
 
 
 def test_live_host_requires_vpn_precheck_before_launch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -144,8 +152,13 @@ def test_live_host_requires_vpn_precheck_before_launch(monkeypatch: pytest.Monke
     context = FakeContext(page=page, cookies_sequence=[cookies])
     browser = FakeBrowser(context=context)
     vpn_checks: list[str] = []
+    launch_calls: list[dict[str, object]] = []
 
-    monkeypatch.setattr(platform_auth, "sync_playwright", lambda: FakePlaywrightManager(browser))
+    def fake_launch(**kwargs: object) -> FakeBrowserSession:
+        launch_calls.append(kwargs)
+        return FakeBrowserSession(context=context, browser=None)
+
+    monkeypatch.setattr(platform_auth, "launch_stealth_browser", fake_launch)
     monkeypatch.setattr(
         platform_auth,
         "resolve_superset_credentials",
@@ -178,13 +191,16 @@ def test_live_host_requires_vpn_precheck_before_launch(monkeypatch: pytest.Monke
 
 
 def test_live_host_stops_when_vpn_precheck_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    sync_calls: list[str] = []
+    launch_calls: list[dict[str, object]] = []
 
-    monkeypatch.setattr(
-        platform_auth,
-        "sync_playwright",
-        lambda: sync_calls.append("called") or FakePlaywrightManager(FakeBrowser(FakeContext(FakePage(url="https://unused"), []))),
-    )
+    def fake_launch(**kwargs: object) -> FakeBrowserSession:
+        launch_calls.append(kwargs)
+        return FakeBrowserSession(
+            context=FakeContext(FakePage(url="https://unused"), []),
+            browser=None,
+        )
+
+    monkeypatch.setattr(platform_auth, "launch_stealth_browser", fake_launch)
     monkeypatch.setattr(
         platform_auth,
         "resolve_superset_credentials",
@@ -200,4 +216,4 @@ def test_live_host_stops_when_vpn_precheck_fails(monkeypatch: pytest.MonkeyPatch
     with pytest.raises(RuntimeError, match="FortiClient VPN is required"):
         bootstrap.login_and_capture()
 
-    assert sync_calls == []
+    assert launch_calls == []
