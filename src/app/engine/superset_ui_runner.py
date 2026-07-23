@@ -12,13 +12,7 @@ from app.engine.superset_auth import cookie_matches_base_url, sanitize_url
 from app.engine.superset_client import QueryResult, normalize_sql_json_to_dataframe
 from app.engine.superset_probe_support import SupersetNetworkProbe, is_sql_lab_candidate
 
-try:
-    from playwright.sync_api import sync_playwright as _sync_playwright
-except ImportError:
-    _sync_playwright = None
-
-
-sync_playwright = _sync_playwright
+from app.engine.browser_factory import close_browser_session, launch_stealth_browser
 
 DEFAULT_UI_RESPONSE_WAIT_TIMEOUT_MS = 30_000
 DEFAULT_UI_RESPONSE_POLL_INTERVAL_MS = 1_000
@@ -79,19 +73,6 @@ class BrowserInstance(Protocol):
     def new_context(self) -> BrowserContext: ...
     def new_page(self) -> BrowserPage: ...
     def close(self) -> None: ...
-
-
-class ChromiumLauncher(Protocol):
-    def launch(self, headless: bool) -> BrowserInstance: ...
-
-
-class PlaywrightInstance(Protocol):
-    chromium: ChromiumLauncher
-
-
-class PlaywrightContextManager(Protocol):
-    def __enter__(self) -> PlaywrightInstance: ...
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None: ...
 
 
 class BrowserRequest(Protocol):
@@ -278,7 +259,7 @@ class SupersetUiRunner:
         self,
         sql_lab_url: str,
         auth_cookies: list[dict[str, Any]] | None = None,
-        headless: bool = True,
+        headless: bool = False,
         response_wait_intervals_ms: Iterable[int] | None = None,
         response_wait_timeout_ms: int = DEFAULT_UI_RESPONSE_WAIT_TIMEOUT_MS,
         response_poll_interval_ms: int = DEFAULT_UI_RESPONSE_POLL_INTERVAL_MS,
@@ -319,9 +300,6 @@ class SupersetUiRunner:
         self.page.screenshot(path=str(screenshot_path))
 
     def run_query(self, sql: str) -> QueryResult:
-        if sync_playwright is None and self.page is None:
-            raise RuntimeError("Playwright is required for UI fallback execution")
-
         payload_rows: list[dict[str, Any]] | None = None
         captured_empty_result = False
         editor_error: Exception | None = None
@@ -331,24 +309,20 @@ class SupersetUiRunner:
         active_query_row: dict[str, Any] | None = None
         accepted_via_network = False
         run_clicked = False
-        managed_playwright_context: PlaywrightContextManager | None = None
-        managed_browser: BrowserInstance | None = None
-        managed_context: BrowserContext | None = None
+        managed_session = None
         try:
             if self.page is not None:
                 page = self.page
             elif self.context is not None:
                 page = self.context.new_page()
             else:
-                managed_playwright_context = cast(PlaywrightContextManager, sync_playwright())
-                playwright = managed_playwright_context.__enter__()
-                managed_browser = playwright.chromium.launch(headless=self.headless)
+                managed_session = launch_stealth_browser(headless=self.headless)
+                managed_context = managed_session.context
                 if self.auth_cookies:
-                    managed_context = managed_browser.new_context()
                     managed_context.add_cookies(self.auth_cookies)
-                    page = managed_context.new_page()
-                else:
-                    page = managed_browser.new_page()
+                page = managed_context.new_page()
+                self.context = managed_context
+                self.browser = managed_session.browser
 
             network_probe = SupersetNetworkProbe().attach(page)
             self._emit_debug("page.ready", current_url=sanitize_url(str(getattr(page, "url", self.sql_lab_url))))
@@ -521,16 +495,8 @@ class SupersetUiRunner:
                     payload_rows = visible_rows
                     self._emit_debug("results.accepted_visible_fallback", row_count=len(payload_rows))
         finally:
-            try:
-                if managed_context is not None:
-                    managed_context.close()
-            finally:
-                try:
-                    if managed_browser is not None:
-                        managed_browser.close()
-                finally:
-                    if managed_playwright_context is not None:
-                        managed_playwright_context.__exit__(None, None, None)
+            if managed_session is not None:
+                close_browser_session(managed_session)
 
         if payload_rows is None and not captured_empty_result:
             current_page = sanitize_url(str(getattr(page, "url", self.sql_lab_url)))

@@ -327,3 +327,91 @@ def test_ui_runner_rejects_results_payload_with_mismatched_query_id(monkeypatch)
 
     with pytest.raises(RuntimeError, match="resultsKey=key-200"):
         runner.run_query("SELECT * FROM foo WHERE art.level_2_code='02'")
+
+def test_ui_runner_self_launch_uses_browser_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    launch_calls: list[dict[str, object]] = []
+    closed: list[object] = []
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.handlers: dict[str, object] = {}
+            self.goto_calls: list[tuple[str, str]] = []
+            self.url = "https://example.test/superset/sqllab/"
+
+        def on(self, event: str, handler) -> None:
+            self.handlers[event] = handler
+
+        def remove_listener(self, event: str, handler) -> None:
+            self.handlers.pop(event, None)
+
+        def goto(self, url: str, wait_until: str = "load") -> None:
+            self.goto_calls.append((url, wait_until))
+
+        def wait_for_timeout(self, ms: int) -> None:
+            return None
+
+        def wait_for_selector(self, selector: str, timeout: int = 0):
+            raise AssertionError("should not reach editor path in this test")
+
+        def wait_for_function(self, script: str, arg: object | None = None) -> None:
+            raise AssertionError("should not wait for SQL Lab markers in this test")
+
+        def evaluate(self, script: str, arg: object | None = None) -> object:
+            return []
+
+        def content(self) -> str:
+            return "<html></html>"
+
+        def screenshot(self, path: str) -> None:
+            return None
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages: list[FakePage] = []
+            self.added_cookies: list[list[dict[str, object]]] = []
+            self.closed = False
+
+        def new_page(self) -> FakePage:
+            page = FakePage()
+            self.pages.append(page)
+            return page
+
+        def add_cookies(self, cookies: list[dict[str, object]]) -> None:
+            self.added_cookies.append(cookies)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.manager = object()
+            self.context = FakeContext()
+            self.browser = None
+
+    def fake_launch(**kwargs: object) -> FakeSession:
+        launch_calls.append(kwargs)
+        return FakeSession()
+
+    def fake_close(session: FakeSession) -> None:
+        closed.append(session)
+        session.context.close()
+
+    monkeypatch.setattr(ui_runner_module, "launch_stealth_browser", fake_launch)
+    monkeypatch.setattr(ui_runner_module, "close_browser_session", fake_close)
+
+    runner = SupersetUiRunner(
+        sql_lab_url="https://example.test/superset/sqllab/",
+        auth_cookies=[{"name": "session", "value": "abc", "domain": "example.test", "path": "/"}],
+        response_wait_intervals_ms=(1,),
+    )
+
+    try:
+        runner.run_query("select 1")
+    except Exception:
+        # expected: fails later at editor selectors; launch must already have happened
+        pass
+
+    assert launch_calls
+    assert launch_calls[0]["headless"] is False
+    assert closed
+
