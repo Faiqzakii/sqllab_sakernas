@@ -48,7 +48,8 @@ It does **not yet** have the full anomaly/rule persistence pipeline implemented.
 
 3. **UI fallback execution**
    - `src/app/engine/superset_ui_runner.py`
-   - Uses Playwright to interact with SQL Lab.
+   - Uses Camoufox stealth browser via `browser_factory` to interact with SQL Lab.
+   - Requires `camoufox fetch` once; persistent profile lives in `.camoufox-profile/` (override with `SUPERSET_BROWSER_PROFILE_DIR`).
    - This is the most sensitive part of the project.
    - Most debugging time has gone here.
 
@@ -142,7 +143,7 @@ Full multi-batch execution is much better than before, but still the most fragil
 
 Key reasons:
 - SQL Lab is stateful
-- UI fallback depends on live Playwright response timing
+- UI fallback depends on live Camoufox/browser response timing
 - Batch result correlation is sensitive
 - `/results/` responses and `updated_since` metadata can arrive out of order
 
@@ -255,6 +256,7 @@ This multi-argument `CONCAT(...)` is valid.
 ## 7. Most important files
 
 ### Core runtime
+- `src/app/engine/browser_factory.py`
 - `src/app/engine/superset_auth.py`
 - `src/app/engine/superset_client.py`
 - `src/app/engine/superset_ui_runner.py`
@@ -413,7 +415,7 @@ Expose those findings in the web UI.
 
 1. Do not trust visible SQL Lab tables as the source of truth if `/results/` is available.
 2. Treat `updated_since` as metadata only, never as row data.
-3. Be very careful with reused Playwright page state across batches.
+3. Be very careful with reused Camoufox page state across batches.
 4. Prefer direct runtime traces over assumptions when debugging Superset behavior.
 5. Keep `data/dataset.duckdb` as the canonical current queryable dataset.
 6. Keep JSON artifacts as debug output, not the primary SQL source.

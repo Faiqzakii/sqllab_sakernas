@@ -12,15 +12,10 @@ from app.engine.superset_auth import cookie_matches_base_url, sanitize_url
 from app.engine.superset_client import QueryResult, normalize_sql_json_to_dataframe
 from app.engine.superset_probe_support import SupersetNetworkProbe, is_sql_lab_candidate
 
-try:
-    from playwright.sync_api import sync_playwright as _sync_playwright
-except ImportError:
-    _sync_playwright = None
+from app.engine.browser_factory import close_browser_session, launch_stealth_browser
 
-
-sync_playwright = _sync_playwright
-
-DEFAULT_UI_RESPONSE_WAIT_TIMEOUT_MS = 30_000
+DEFAULT_UI_RESPONSE_WAIT_TIMEOUT_MS = 60_000
+DEFAULT_UI_PENDING_WAIT_TIMEOUT_MS = 600_000
 DEFAULT_UI_RESPONSE_POLL_INTERVAL_MS = 1_000
 WELCOME_TO_SQL_LAB_LINK_SELECTOR = 'a[href="/superset/sqllab/"]'
 SQL_LAB_RESULT_TABLE_XPATH = "/html/body/div[2]/div/div/div[2]/div/div[126]/div/div[3]/div[3]/div/div[2]/div/div[1]/div/div[3]/div/div/div/div/div/div/div/div[1]/table"
@@ -34,6 +29,29 @@ SQL_LAB_RUN_SELECTORS = (
 SQL_LAB_RESULT_READY_TEXT = "rows returned"
 SQL_EDITOR_SETTLE_DELAY_MS = 500
 SQL_BATCH_SETTLE_DELAY_MS = 1000
+SQL_LAB_READY_TIMEOUT_MS = 180_000
+BOT_BLOCK_BODY_MARKERS = (
+    "bot detected",
+    "your request was blocked",
+    "request rejected",
+    "access denied by",
+)
+BOT_ID_RE = re.compile(r"\bBOT-\d+\b", re.IGNORECASE)
+
+
+def detect_waf_bot_block(body: str) -> str | None:
+    """Return short WAF bot-block label if body looks like F5/bot HTML, else None."""
+    if not body:
+        return None
+    lowered = body.lower()
+    if not any(marker in lowered for marker in BOT_BLOCK_BODY_MARKERS):
+        # Bare BOT- id alone is weak; require HTML-ish shell or explicit marker.
+        if "bot-" not in lowered or "<" not in body:
+            return None
+    match = BOT_ID_RE.search(body)
+    bot_id = match.group(0) if match else "unknown"
+    return f"WAF bot block ({bot_id})"
+
 
 
 def build_wait_intervals(total_timeout_ms: int, poll_interval_ms: int) -> tuple[int, ...]:
@@ -60,7 +78,7 @@ class BrowserPage(Protocol):
     def click(self, selector: str) -> None: ...
     def wait_for_timeout(self, timeout: int) -> None: ...
     def wait_for_load_state(self, state: str) -> None: ...
-    def wait_for_function(self, script: str, arg: object | None = None) -> None: ...
+    def wait_for_function(self, script: str, arg: object | None = None, timeout: int | None = None) -> None: ...
     def evaluate(self, script: str, arg: object | None = None) -> object: ...
     def eval_on_selector(self, selector: str, script: str, arg: object | None = None) -> object: ...
     def content(self) -> str: ...
@@ -79,19 +97,6 @@ class BrowserInstance(Protocol):
     def new_context(self) -> BrowserContext: ...
     def new_page(self) -> BrowserPage: ...
     def close(self) -> None: ...
-
-
-class ChromiumLauncher(Protocol):
-    def launch(self, headless: bool) -> BrowserInstance: ...
-
-
-class PlaywrightInstance(Protocol):
-    chromium: ChromiumLauncher
-
-
-class PlaywrightContextManager(Protocol):
-    def __enter__(self) -> PlaywrightInstance: ...
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None: ...
 
 
 class BrowserRequest(Protocol):
@@ -149,17 +154,28 @@ def wait_for_sql_lab_link_marker(page: BrowserPage) -> None:
     )
 
 
-def wait_for_sql_lab_page(page: BrowserPage) -> None:
+def wait_for_sql_lab_page(page: BrowserPage, timeout_ms: int = SQL_LAB_READY_TIMEOUT_MS) -> None:
     page.wait_for_function(
         "(expectedUrlPart) => window.location.pathname.includes(expectedUrlPart)",
-        "/superset/sqllab/",
+        arg="/superset/sqllab/",
+        timeout=timeout_ms,
     )
 
 
-def wait_for_sql_lab_result_ready_marker(page: BrowserPage) -> None:
+def wait_for_sql_lab_editor_ready(page: BrowserPage, timeout_ms: int = SQL_LAB_READY_TIMEOUT_MS) -> None:
+    # URL alone is not enough — SPA shell can still be mounting Ace.
+    wait_for_sql_lab_page(page, timeout_ms=timeout_ms)
+    page.wait_for_function(
+        "() => Array.from(document.querySelectorAll('.ace_editor')).some(node => node instanceof HTMLElement && node.offsetParent !== null)",
+        timeout=timeout_ms,
+    )
+
+
+def wait_for_sql_lab_result_ready_marker(page: BrowserPage, timeout_ms: int = SQL_LAB_READY_TIMEOUT_MS) -> None:
     page.wait_for_function(
         "(expectedText) => document.body.textContent !== null && document.body.textContent.includes(expectedText)",
-        SQL_LAB_RESULT_READY_TEXT,
+        arg=SQL_LAB_RESULT_READY_TEXT,
+        timeout=timeout_ms,
     )
 
 
@@ -171,15 +187,20 @@ def read_sql_lab_result_table(page: BrowserPage) -> pd.DataFrame:
     return rows_to_dataframe(rows)
 
 
+def snapshot_visible_result_rows(page: BrowserPage) -> list[dict[str, Any]] | None:
+    # No result-marker wait: used for pre-run baseline on a still-loading page.
+    table_dataframe = read_sql_lab_result_table(page)
+    if table_dataframe.empty:
+        return None
+    return cast(list[dict[str, Any]], table_dataframe.to_dict(orient="records"))
+
+
 def capture_visible_result_rows(page: BrowserPage) -> list[dict[str, Any]] | None:
     try:
         wait_for_sql_lab_result_ready_marker(page)
     except Exception:
         pass
-    table_dataframe = read_sql_lab_result_table(page)
-    if table_dataframe.empty:
-        return None
-    return cast(list[dict[str, Any]], table_dataframe.to_dict(orient="records"))
+    return snapshot_visible_result_rows(page)
 
 
 def rows_signature(rows: list[dict[str, Any]] | None) -> str | None:
@@ -210,9 +231,10 @@ def read_editor_sql(page: BrowserPage) -> str | None:
     return editor_value if isinstance(editor_value, str) else None
 
 
-def wait_for_visible_ace_editor(page: BrowserPage) -> None:
+def wait_for_visible_ace_editor(page: BrowserPage, timeout_ms: int = SQL_LAB_READY_TIMEOUT_MS) -> None:
     page.wait_for_function(
-        "() => Array.from(document.querySelectorAll('.ace_editor')).some(node => node instanceof HTMLElement && node.offsetParent !== null)"
+        "() => Array.from(document.querySelectorAll('.ace_editor')).some(node => node instanceof HTMLElement && node.offsetParent !== null)",
+        timeout=timeout_ms,
     )
 
 
@@ -278,9 +300,10 @@ class SupersetUiRunner:
         self,
         sql_lab_url: str,
         auth_cookies: list[dict[str, Any]] | None = None,
-        headless: bool = True,
+        headless: bool = False,
         response_wait_intervals_ms: Iterable[int] | None = None,
         response_wait_timeout_ms: int = DEFAULT_UI_RESPONSE_WAIT_TIMEOUT_MS,
+        pending_wait_timeout_ms: int = DEFAULT_UI_PENDING_WAIT_TIMEOUT_MS,
         response_poll_interval_ms: int = DEFAULT_UI_RESPONSE_POLL_INTERVAL_MS,
         browser: BrowserInstance | None = None,
         context: BrowserContext | None = None,
@@ -294,6 +317,8 @@ class SupersetUiRunner:
         self.context = context
         self.page = page
         self.debug_callback = debug_callback
+        self.response_poll_interval_ms = response_poll_interval_ms
+        self.pending_wait_timeout_ms = pending_wait_timeout_ms
         self.response_wait_intervals_ms = (
             tuple(response_wait_intervals_ms)
             if response_wait_intervals_ms is not None
@@ -319,9 +344,6 @@ class SupersetUiRunner:
         self.page.screenshot(path=str(screenshot_path))
 
     def run_query(self, sql: str) -> QueryResult:
-        if sync_playwright is None and self.page is None:
-            raise RuntimeError("Playwright is required for UI fallback execution")
-
         payload_rows: list[dict[str, Any]] | None = None
         captured_empty_result = False
         editor_error: Exception | None = None
@@ -331,28 +353,38 @@ class SupersetUiRunner:
         active_query_row: dict[str, Any] | None = None
         accepted_via_network = False
         run_clicked = False
-        managed_playwright_context: PlaywrightContextManager | None = None
-        managed_browser: BrowserInstance | None = None
-        managed_context: BrowserContext | None = None
+        managed_session = None
         try:
             if self.page is not None:
                 page = self.page
             elif self.context is not None:
                 page = self.context.new_page()
             else:
-                managed_playwright_context = cast(PlaywrightContextManager, sync_playwright())
-                playwright = managed_playwright_context.__enter__()
-                managed_browser = playwright.chromium.launch(headless=self.headless)
+                managed_session = launch_stealth_browser(headless=self.headless)
+                managed_context = managed_session.context
                 if self.auth_cookies:
-                    managed_context = managed_browser.new_context()
                     managed_context.add_cookies(self.auth_cookies)
-                    page = managed_context.new_page()
-                else:
-                    page = managed_browser.new_page()
+                page = managed_context.new_page()
+                self.context = managed_context
+                self.browser = managed_session.browser
 
             network_probe = SupersetNetworkProbe().attach(page)
+
+            page_url = sanitize_url(str(getattr(page, "url", self.sql_lab_url)))
+            if page_url.rstrip("/").endswith("/superset/welcome"):
+                wait_for_sql_lab_link_marker(page)
+                page.click(WELCOME_TO_SQL_LAB_LINK_SELECTOR)
+                page.wait_for_load_state("domcontentloaded")
+                wait_for_sql_lab_page(page)
+            elif not page_url.rstrip("/").endswith("/superset/sqllab"):
+                # commit: SPA often never fires domcontentloaded
+                page.goto(self.sql_lab_url, wait_until="commit")
+                wait_for_sql_lab_page(page)
+
+            # page.ready only after Ace is actually mountable
+            wait_for_sql_lab_editor_ready(page)
             self._emit_debug("page.ready", current_url=sanitize_url(str(getattr(page, "url", self.sql_lab_url))))
-            previous_visible_rows = capture_visible_result_rows(page)
+            previous_visible_rows = snapshot_visible_result_rows(page)
             previous_visible_signature = rows_signature(previous_visible_rows)
             self._emit_debug("result.previous_visible", signature=previous_visible_signature)
 
@@ -372,8 +404,40 @@ class SupersetUiRunner:
                     return
                 try:
                     payload = response.json()
-                except Exception:
-                    self._emit_debug("response.unreadable", url=response_url)
+                except Exception as exc:
+                    body_preview = ""
+                    try:
+                        text_getter = getattr(response, "text", None)
+                        if callable(text_getter):
+                            body_preview = str(text_getter() or "")[:800]
+                    except Exception:
+                        body_preview = ""
+                    looks_like_html = body_preview.lstrip().startswith("<") or "Unexpected '<'" in str(exc)
+                    bot_label = detect_waf_bot_block(body_preview) if looks_like_html else None
+                    self._emit_debug(
+                        "response.unreadable",
+                        url=response_url,
+                        error=repr(exc),
+                        html_body=looks_like_html,
+                        bot_block=bot_label,
+                    )
+                    # SPA auto-stop after blocked execute — ignore its HTML body.
+                    if "/api/v1/query/stop" in response_url:
+                        return
+                    if looks_like_html and (
+                        "/api/v1/sqllab/execute/" in response_url
+                        or "/api/v1/sqllab/results/" in response_url
+                    ):
+                        if bot_label:
+                            execute_error = RuntimeError(
+                                f"{bot_label}: SQL Lab execute returned HTML "
+                                f"(not session logout; url={response_url})"
+                            )
+                        else:
+                            execute_error = RuntimeError(
+                                "SQL Lab returned HTML instead of JSON "
+                                f"(possible logout/session expiry; url={response_url})"
+                            )
                     return
                 if "/api/v1/sqllab/execute/" in response_url and isinstance(payload, dict):
                     self._emit_debug("execute.response", payload=payload)
@@ -395,6 +459,7 @@ class SupersetUiRunner:
                             return
                         if query_payload.get("resultsKey"):
                             execute_success_query = query_payload
+                            execute_pending_query = None
                             self._emit_debug("execute.success_metadata", query=query_payload)
                         else:
                             execute_pending_query = query_payload
@@ -410,9 +475,12 @@ class SupersetUiRunner:
                                 continue
                             active_query_row = row
                             self._emit_debug("updated_since.accepted", row=row)
-                            if row.get("resultsKey"):
+                            row_results_key = row.get("resultsKey") or row.get("results_key")
+                            if row_results_key:
                                 execute_success_query = row
-                            else:
+                                execute_pending_query = None
+                            elif execute_success_query is None:
+                                # Keep existing success metadata; do not demote to pending.
                                 execute_pending_query = row
                             break
                 if isinstance(payload, list):
@@ -442,7 +510,12 @@ class SupersetUiRunner:
 
                         response_results_key = extract_results_key_from_url(response_url)
 
-                        if expected_results_key is not None and response_results_key != expected_results_key:
+                        # Only reject when both sides parse a key and they differ.
+                        if (
+                            expected_results_key is not None
+                            and response_results_key is not None
+                            and response_results_key != expected_results_key
+                        ):
                             self._emit_debug(
                                 "results.rejected_results_key_mismatch",
                                 response_results_key=response_results_key,
@@ -475,14 +548,6 @@ class SupersetUiRunner:
                         return
 
             page.on("response", capture_response)
-            page_url = sanitize_url(str(getattr(page, "url", self.sql_lab_url)))
-            if page_url.rstrip("/").endswith("/superset/welcome"):
-                wait_for_sql_lab_link_marker(page)
-                page.click(WELCOME_TO_SQL_LAB_LINK_SELECTOR)
-                page.wait_for_load_state("domcontentloaded")
-                wait_for_sql_lab_page(page)
-            else:
-                page.goto(self.sql_lab_url, wait_until="domcontentloaded")
             try:
                 self._emit_debug("editor.fill.start")
                 fill_sql_editor(page, sql)
@@ -505,7 +570,7 @@ class SupersetUiRunner:
                         payload_rows = visible_rows
 
             for wait_interval_ms in self.response_wait_intervals_ms:
-                if payload_rows is not None or captured_empty_result:
+                if payload_rows is not None or captured_empty_result or execute_error is not None:
                     break
                 page.wait_for_timeout(wait_interval_ms)
                 self._emit_debug("results.wait_tick", wait_ms=wait_interval_ms)
@@ -515,22 +580,54 @@ class SupersetUiRunner:
                         payload_rows = visible_rows
                         self._emit_debug("results.accepted_visible", row_count=len(payload_rows))
 
+            # Pending/running is normal for slow SQL Lab pages — keep polling.
+            pending_elapsed_ms = 0
+            while (
+                payload_rows is None
+                and not captured_empty_result
+                and editor_error is None
+                and execute_error is None
+                and pending_elapsed_ms < self.pending_wait_timeout_ms
+                and (
+                    execute_pending_query is not None
+                    or execute_success_query is not None
+                    or active_query_row is not None
+                )
+            ):
+                status_source = execute_success_query or active_query_row or execute_pending_query or {}
+                state = str(status_source.get("state") or "").lower()
+                # Still waiting while server says pending/running, or we have metadata but no rows yet.
+                waiting_states = {"", "pending", "running", "started", "scheduled", "success"}
+                if state not in waiting_states and state not in {"finished", "done"}:
+                    break
+                page.wait_for_timeout(self.response_poll_interval_ms)
+                pending_elapsed_ms += self.response_poll_interval_ms
+                self._emit_debug(
+                    "results.pending_wait_tick",
+                    wait_ms=self.response_poll_interval_ms,
+                    elapsed_ms=pending_elapsed_ms,
+                    state=state,
+                    queryId=status_source.get("queryId") or status_source.get("query_id"),
+                    resultsKey=status_source.get("resultsKey") or status_source.get("results_key"),
+                )
+                # Prefer network capture (handler fills payload_rows); also accept visible table change.
+                # snapshot_* only — never wait for result marker mid-poll (that would block 180s/tick).
+                visible_rows = snapshot_visible_result_rows(page)
+                if rows_signature(visible_rows) != previous_visible_signature:
+                    payload_rows = visible_rows
+                    self._emit_debug("results.accepted_visible_pending", row_count=len(payload_rows))
+                    break
+                if execute_success_query is not None and execute_success_query.get("resultsKey"):
+                    execute_pending_query = None
+
             if payload_rows is None and execute_success_query is None and active_query_row is None and execute_pending_query is None and editor_error is None:
                 visible_rows = capture_visible_result_rows(page)
                 if visible_rows is not None:
                     payload_rows = visible_rows
                     self._emit_debug("results.accepted_visible_fallback", row_count=len(payload_rows))
         finally:
-            try:
-                if managed_context is not None:
-                    managed_context.close()
-            finally:
-                try:
-                    if managed_browser is not None:
-                        managed_browser.close()
-                finally:
-                    if managed_playwright_context is not None:
-                        managed_playwright_context.__exit__(None, None, None)
+            if managed_session is not None:
+                close_browser_session(managed_session)
 
         if payload_rows is None and not captured_empty_result:
             current_page = sanitize_url(str(getattr(page, "url", self.sql_lab_url)))
